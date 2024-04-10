@@ -26,9 +26,7 @@ from edit_video.patch import apply_patch, update_patch
 
 from masactrl.masactrl import MutualSelfAttentionControl
 from masactrl.masactrl_utils import regiter_attention_editor_diffusers
-# from masactrl.diffuser_utils import MasaCtrlPipeline
-# from masactrl.masactrl_utils import AttentionBase
-# from masactrl.masactrl_utils import regiter_attention_editor_diffusers
+
 class SDEditer(StableDiffusionPipeline):
     
     def __init__(self, config,vae: AutoencoderKL, text_encoder: CLIPTextModel, tokenizer: CLIPTokenizer, unet: UNet2DConditionModel, scheduler: KarrasDiffusionSchedulers, safety_checker: StableDiffusionSafetyChecker, feature_extractor: CLIPImageProcessor, image_encoder: CLIPVisionModelWithProjection = None,requires_safety_checker: bool = True):
@@ -325,7 +323,7 @@ class SDEditer(StableDiffusionPipeline):
         return conds, prompts
 
     def inversion(self,data_path, save_path):
-        # self.scheduler.set_timesteps(self.steps)
+        self.scheduler.set_timesteps(self.steps) # reset timesteps
         save_path = get_latents_dir(save_path, self.model_key)
         os.makedirs(save_path, exist_ok = True)
         if self.check_latent_exists(save_path) and not self.edit_config.inversion.force:
@@ -513,7 +511,7 @@ class SDEditer(StableDiffusionPipeline):
         self.activate_vidtome()
         if self.use_pnp:
             self.init_pnp()
-        self.scheduler.set_timesteps(self.n_timesteps)
+        self.scheduler.set_timesteps(self.n_timesteps) # reset timesteps
         latent_path = get_latents_dir(latent_path, self.model_key)
 
         assert self.gen_check_latent_exists(
@@ -533,6 +531,7 @@ class SDEditer(StableDiffusionPipeline):
             if self.use_pnp:
                 conds = self.get_text_embeds([self.inv_prompt,edit_prompt], [self.negative_prompt,self.negative_prompt])
                 clean_latent = self.gen_ddim_sample(self.init_noise, conds)
+                src,clean_latent = clean_latent.chunk(2)
             else:
                 conds = self.get_text_embeds(edit_prompt, self.negative_prompt)
                 # Comment this if you have enough GPU memory
