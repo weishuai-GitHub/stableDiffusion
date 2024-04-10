@@ -1,5 +1,33 @@
 # 基于stable diffusion的图像编辑
 
+## iamge demo
+
+<table style="width: 100%;">
+        <tr>
+            <td style="width: 50%;">
+                <img src="demo/cat/Cat_0.png">
+                <p>reference image</p>
+            </td>
+            <td style="width: 50%;">
+                <img src="demo/cat/Cat_Cute_0.png">
+                <p> cute style </p>
+            </td>
+        </tr>
+</table>
+
+<table style="width: 100%;">
+        <tr>
+            <td style="width: 50%;">
+                <img src="demo/cat/Cat_Fauvism_0.png">
+                <p> Fauvism style </p>
+            </td>
+            <td style="width: 50%;">
+                <img src="demo/cat/Cat_Gta5_1.png">
+                <p> Gta5 style </p>
+            </td>
+        </tr>
+</table>
+## Video demo
 <table style="width: 100%;">
         <tr>
             <td style="width: 50%;">

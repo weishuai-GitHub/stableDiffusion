@@ -1,4 +1,3 @@
-*.png
 *.jpeg
 *.jpg
 *.pt
@@ -7,6 +6,7 @@
 *.txt
 .vscode
 tmp.py
+latent
 CompVis
 runwayml
 stabilityai
