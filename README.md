@@ -1,6 +1,6 @@
 # 基于stable diffusion的图像编辑
 
-## iamge demo
+## image demo
 
 <table style="width: 100%;">
         <tr>
