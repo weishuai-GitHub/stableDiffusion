@@ -6,6 +6,7 @@
 *.csv
 *.txt
 .vscode
+tmp.py
 CompVis
 runwayml
 stabilityai
