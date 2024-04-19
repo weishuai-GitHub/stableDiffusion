@@ -59,10 +59,12 @@ from util.model import DINOHead,MLP
 from util.utils import DistillLoss, SupConLoss,get_params_groups, info_nce_logits
 DICT_W={'stabilityai/stable-diffusion-2-1':31.2,
         'stabilityai/stable-diffusion-2-1-base':31.16,
-        "CompVis/stable-diffusion-v1-4":27.63}
+        "CompVis/stable-diffusion-v1-4":27.63,
+        "runwayml/stable-diffusion-v1-5":27.63}
 DICT_B={'stabilityai/stable-diffusion-2-1':7.2,
         'stabilityai/stable-diffusion-2-1-base':52.53,
-        "CompVis/stable-diffusion-v1-4":4.33}
+        "CompVis/stable-diffusion-v1-4":4.33,
+        "runwayml/stable-diffusion-v1-5":4.33}
 # model_id = "CompVis/stable-diffusion-v1-4"
 # model_id  = "stabilityai/stable-diffusion-2-1" 
 # model_id  = "runwayml/stable-diffusion-v1-5"

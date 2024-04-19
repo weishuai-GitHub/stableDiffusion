@@ -15,13 +15,13 @@ inversion:
   force: True
 
 generation:
-  control: "none"
+  control: "None"
   guidance_scale: 7.5 # CFG scale
   n_timesteps: 50
   negative_prompt: "ugly, blurry, low res"
   prompt:
     VG: "a dog walking on the ground near a bush, Van Gogh style."
-    desert: "a dog walking in the desert near a bush."
+    # desert: "a dog walking in the desert near a bush."
 
 
   latents_path: "${work_dir}/latents"

@@ -151,7 +151,7 @@ def run_on_prompt(prompt:Union[str, List[str]],
 def main(config: RunConfig):
     # from transformers import CLIPTextModel, CLIPTokenizer,CLIPImageProcessor
     root = "/opt/data/private/stable_diffusion_model"
-    textual_name = "textual_inversion_find_xl_mixed_768_1"
+    textual_name = "textual_inversion_find_mixed_768_1_5"
     # placeholder_token = '<style>'
     nums_token = 768
     #"runwayml/stable-diffusion-v1-5"
@@ -160,8 +160,8 @@ def main(config: RunConfig):
     #stabilityai/stable-diffusion-2-1
     #stabilityai/sd-turbo
     #stabilityai/stable-diffusion-xl-base-1.0
-    model_id = "stabilityai/stable-diffusion-xl-base-1.0"
-    repo_id = "stabilityai/stable-diffusion-xl-base-1.0"
+    model_id = "runwayml/stable-diffusion-v1-5"
+    repo_id = "runwayml/stable-diffusion-v1-5"
     name =''
     for x in model_id.split('/'):
         name += x+'_'
@@ -177,7 +177,7 @@ def main(config: RunConfig):
     head = MLP(in_dim=768, out_dim=nums_token,bottleneck_dim=bottleneck_dim,nlayers=3)
     image_model = torch.nn.Sequential(backbone, head)
     image_model.load_state_dict(state_dict)
-    pipe = TextaulStableDiffusionXLPipeline.from_pretrained(repo_id,
+    pipe = TextaulStableDiffusionPipeline.from_pretrained(repo_id,
                                                     torch_dtype=torch.float16)
     pipe.unet.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
@@ -188,11 +188,8 @@ def main(config: RunConfig):
     device = torch.device('cuda:0')
     pipe.to(device)
     prompts = [
-            # "Painting of a S and a cute S in the style of S",
-            # 'a photo of dog and cat',
-            'a photo of # and #',
+            'A dog in the style of #',
             # 'a photo of a # #',
-            # 'Painting of a S in the corner in the style of S',
         ]
     referenceText = None
     image_size = 224
@@ -205,15 +202,8 @@ def main(config: RunConfig):
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                             std=[0.229, 0.224, 0.225]),])
     image_path =[
-        # "datasets/Mixed_dataset/panda/a bright photo of the panda_124.jpg",
-        # "dataset_mixed/mask.png",
-        # "datasets/Mixed_dataset/teddybear/marina-shatskih-kBo2MFJz2QU-unsplash.jpg",
-        # "datasets/Mixed_dataset/cat/jeanie-de-klerk-av2WGfogjqg-unsplash.jpg",
-        # "datasets/Mixed_dataset/Gta5/R.jpg",
-        # "datasets/Mixed_dataset/Pot/0.png",
-        # "datasets/Mixed_dataset/Ande/Q.jpg",
-        "datasets/Mixed_dataset/panda/a bright photo of the panda_202.jpg",
-        # "datasets/Mixed_dataset/Fauvism/albert-marquet_street-lamp-arcueil-1899.jpg",
+        "datasets/style_datasets/Fauvism/adam-baltatu_house-on-siret-valley.jpg",
+        # "datasets/style_datasets/Ande/Q.jpg",
         ]
     referenceImage = []
     image_name = ''
@@ -238,7 +228,7 @@ def main(config: RunConfig):
         referenceImage.append(trans(image))
     if pixel_values is not None:
         pixel_values = pixel_values.to(device)
-    token_indices = [3,5]
+    token_indices = [6]
     indices_to_alter = [5]
     # referenceImage =[]
     # token_indices = []

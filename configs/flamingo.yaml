@@ -6,7 +6,7 @@ height: 512
 width: 512
 
 inversion:
-  prompt:  '' #"flamingos standing in the water near a tree."
+  prompt: ""
   batch_size: 2
   save_steps: 50
   force: False
@@ -17,8 +17,9 @@ generation:
   n_timesteps: 50
   negative_prompt: ""
   prompt:
-    origami: "rainbow-colored origami flamingos standing in the water near a tree, best quality."
-# rainbow-colored origami flamingos standing in the water near a tree.
+    # origami: "rainbow-colored origami flamingos standing in the water near a tree, best quality."
+    # sketch: "flamingos standing in the water near a tree, pencil sketch style."
+    cartoon: " flamingos standing in the water near a tree, catoon style."
   chunk_ord: "rand"
   # VidToMe args. See details in "src/vidtome/patch.py, apply_patch()"
   local_merge_ratio: 0.8

@@ -27,6 +27,8 @@ generation:
   # 'pnp' (Plug-and-Play), args:
   pnp_attn_t: 0.5
   pnp_f_t: 0.8
+  refence_image_path: null
+  refence_promt: null
 
   # ['tile', 'softedge', 'depth', 'canny'] (Controlnet), args:
   control_scale: 1.0
@@ -70,7 +72,7 @@ generation:
 
 
 
-seed: 123
+seed: 1222
 # base_config: "configs/default.yaml" # Set a base config file here
 float_precision: "fp16" # "fp16" or "fp32"
 enable_xformers_memory_efficient_attention: True
