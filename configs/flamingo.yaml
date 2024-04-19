@@ -1,0 +1,29 @@
+sd_version: "2.1" # In ['2.1', '2.0', '1.5', 'depth']
+input_path: "data/flamingo.mp4" # Accept .mp4, .gif file or a folder with png/jpg sequence
+work_dir: "outputs/flamingo"
+
+height: 512
+width: 512
+
+inversion:
+  prompt: ""
+  batch_size: 2
+  save_steps: 50
+  force: False
+  # save_intermediate: False
+
+generation:
+  control: "pnp"
+  n_timesteps: 50
+  negative_prompt: ""
+  prompt:
+    # origami: "rainbow-colored origami flamingos standing in the water near a tree, best quality."
+    # sketch: "flamingos standing in the water near a tree, pencil sketch style."
+    cartoon: " flamingos standing in the water near a tree, catoon style."
+  chunk_ord: "rand"
+  # VidToMe args. See details in "src/vidtome/patch.py, apply_patch()"
+  local_merge_ratio: 0.8
+  global_merge_ratio: 0.5
+
+seed: 112
+base_config: configs/default.yaml
