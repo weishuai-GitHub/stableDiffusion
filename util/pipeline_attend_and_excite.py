@@ -27,8 +27,14 @@ from util.gaussian_smoothing import GaussianSmoothing
 from util.ptp_utils import AttentionStore, TextualControl, aggregate_attention,show_self_attention_comp
 from transformers.models.clip.modeling_clip import _make_causal_mask,_expand_mask
 from transformers.modeling_outputs import BaseModelOutputWithPooling
-DICT_W={'stabilityai/stable-diffusion-2-1':31.2,'stabilityai/stable-diffusion-2-1-base':31.16}
-DICT_B={'stabilityai/stable-diffusion-2-1':7.2,'stabilityai/stable-diffusion-2-1-base':52.53}
+DICT_W={'stabilityai/stable-diffusion-2-1':31.2,
+        'stabilityai/stable-diffusion-2-1-base':31.16,
+        "CompVis/stable-diffusion-v1-4":27.63,
+        "runwayml/stable-diffusion-v1-5":27.63}
+DICT_B={'stabilityai/stable-diffusion-2-1':7.2,
+    'stabilityai/stable-diffusion-2-1-base':52.53,
+    "CompVis/stable-diffusion-v1-4":4.33,
+    "runwayml/stable-diffusion-v1-5":4.33}
 def get_prompt_embeds(model:StableDiffusionPipeline,prompt,referenceProps,
                           attention_mask: Optional[torch.Tensor] = None,
                           output_attentions: Optional[bool] = None,
@@ -923,24 +929,27 @@ class TextaulStableDiffusionPipeline(StableDiffusionPipeline):
 
         # 3. Encode input prompt 
         ## 3.1 get images prop
+        prompt_embeds = []
         if referenceImages is not None:
-            referenceProps = []
-            for image,location in zip(referenceImages,referenceLocattion):
-                image= image.to(device)
-                image = torch.unsqueeze(image,dim=0)
-                weight,bais = image_model(image)
-                '''
-                $weight = 31.2*\frac{w}{||w||}\cdot feat + 7.2* \frac{b}{||b||}$
-                '''
-                weight = F.normalize(weight, dim=-1)
-                weight = 31.2*weight
-                bais = F.normalize(bais, dim=-1)
-                bais = 7.2*bais
-                weight = torch.matmul(weight,self.token_dict['features'])+bais
-                weight = weight*self.token_dict['std']+self.token_dict['mean']
-                placeholder_token_embed = weight
-                referenceProps.append((placeholder_token_embed,location+1))
-            prompt_embeds = get_prompt_embeds(self,prompt,referenceProps)
+            for images,locations,prom in zip(referenceImages,referenceLocattion,prompt):
+                referenceProps = []
+                for image,location in zip(images,locations):
+                    image= image.to(device)
+                    image = torch.unsqueeze(image,dim=0)
+                    weight,bais = image_model(image)
+                    '''
+                    $weight = 31.2*\frac{w}{||w||}\cdot feat + 7.2* \frac{b}{||b||}$
+                    '''
+                    weight = F.normalize(weight, dim=-1)
+                    weight = 31.2*weight
+                    bais = F.normalize(bais, dim=-1)
+                    bais = 7.2*bais
+                    weight = torch.matmul(weight,self.token_dict['features'])+bais
+                    weight = weight*self.token_dict['std']+self.token_dict['mean']
+                    placeholder_token_embed = weight
+                    referenceProps.append((placeholder_token_embed,location+1))
+                prompt_embeds.append(get_prompt_embeds(self,prom,referenceProps))
+        prompt_embeds = torch.cat(prompt_embeds,dim = 0)
         ## 3.2 Encode input prompt
         text_encoder_lora_scale = (
             cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
@@ -1049,7 +1058,7 @@ class TextaulStableDiffusionPipeline(StableDiffusionPipeline):
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
 
 class TextaulStableDiffusionXLPipeline(StableDiffusionXLPipeline):
-
+    
     def get_prompt_embeds(self,prompt,referenceProps,
                           prompt_2: Optional[Union[str, List[str]]] = None,
                           attention_mask: Optional[torch.Tensor] = None,
@@ -1268,6 +1277,7 @@ class TextaulStableDiffusionXLPipeline(StableDiffusionXLPipeline):
                 '''
                 $weight = 27.63*\frac{w}{||w||}\cdot feat + 4.33* \frac{b}{||b||}$
                 '''
+                
                 weight = F.normalize(weight, dim=-1)
                 weight = 27.63*weight
                 bais = F.normalize(bais, dim=-1)
@@ -1527,8 +1537,7 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
         self.check_inputs(
             prompt, height, width, callback_steps, negative_prompt, prompt_embeds, negative_prompt_embeds
         )
-        if pixel_values is None:
-            raise ValueError("pixel_values cann't be None")
+
         # 2. Define call parameters
         self.prompt = prompt
         if prompt is not None and isinstance(prompt, str):
@@ -1548,25 +1557,27 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
             self.token_dict[key].requires_grad_(False)
         # 3. Encode input prompt 
         ## 3.1 get images prop
+        prompt_embeds = []
         if referenceImages is not None:
-            referenceProps = []
-            for image,location in zip(referenceImages,referenceLocattion):
-                image= image.to(device)
-                image = torch.unsqueeze(image,dim=0)
-                weight,bais = image_model(image)
-                '''
-                $weight = 31.2*\frac{w}{||w||}\cdot feat + 7.2* \frac{b}{||b||}$
-                27.63 4.33
-                '''
-                weight = F.normalize(weight, dim=-1)
-                weight = 27.63*weight
-                bais = F.normalize(bais, dim=-1)
-                bais = 4.33*bais
-                weight = torch.matmul(weight,self.token_dict['features'])+bais
-                weight = weight*self.token_dict['std']+self.token_dict['mean']
-                placeholder_token_embed = weight
-                referenceProps.append((placeholder_token_embed,location+1))
-            prompt_embeds = get_prompt_embeds(self,prompt,referenceProps)    
+            for images,locations,prom in zip(referenceImages,referenceLocattion,prompt):
+                referenceProps = []
+                for image,location in zip(images,locations):
+                    image= image.to(device)
+                    image = torch.unsqueeze(image,dim=0)
+                    weight,bais = image_model(image)
+                    '''
+                    $weight = 31.2*\frac{w}{||w||}\cdot feat + 7.2* \frac{b}{||b||}$
+                    '''
+                    weight = F.normalize(weight, dim=-1)
+                    weight = 31.2*weight
+                    bais = F.normalize(bais, dim=-1)
+                    bais = 7.2*bais
+                    weight = torch.matmul(weight,self.token_dict['features'])+bais
+                    weight = weight*self.token_dict['std']+self.token_dict['mean']
+                    placeholder_token_embed = weight
+                    referenceProps.append((placeholder_token_embed,location+1))
+                prompt_embeds.append(get_prompt_embeds(self,prom,referenceProps))
+        prompt_embeds = torch.cat(prompt_embeds,dim = 0)    
         ## 3.2 Encode input prompt
         lora_scale = (
             cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
@@ -1607,12 +1618,8 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         scale_range = np.linspace(scale_range[0], scale_range[1], len(self.scheduler.timesteps))
-        img_latents = self.vae.encode(pixel_values.to(device=device,dtype=latents.dtype)).latent_dist.sample()
-        img_latents = img_latents * self.vae.config.scaling_factor
-        # img_latents = torch.cat([img_latents] * 2) if do_classifier_free_guidance else latents
-        noise = latents.clone()
         
-        controller.turn_off()
+        # controller.turn_off()
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -1622,22 +1629,6 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
                 # noisy_latents = self.scheduler.add_noise(img_latents, noise, t)
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-                if i<3:
-                    controller.turn_off()
-                    noisy_latents = self.scheduler.add_noise(img_latents, noise, t)
-                    input_noisy_latents = torch.cat([noisy_latents] * 2) if do_classifier_free_guidance else noisy_latents
-                    input_noisy_latents = self.scheduler.scale_model_input(input_noisy_latents, t)
-                    latents = noisy_latents
-                    latent_model_input = input_noisy_latents
-                    # self.unet(
-                    #     input_noisy_latents,
-                    #     t,
-                    #     encoder_hidden_states=prompt_embeds,
-                    #     cross_attention_kwargs=cross_attention_kwargs,
-                    # ).sample
-                else:
-                    controller.turn_off()
-                    pass
                 # predict the noise residual
                 noise_pred = self.unet(
                     latent_model_input,
@@ -1653,7 +1644,8 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
-                
+                if i<10:
+                    latents[1] = latents[1] + 1.0* (latents[0] -latents[1])
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
@@ -1761,25 +1753,27 @@ class BlendedDiffusionPipeline(StableDiffusionPipeline):
         # 3. Encode input prompt 
         ## 3.1 get images prop
         index = 0
+        prompt_embeds = []
         if referenceImages is not None:
-            referenceProps = []
-            for i,(image,location) in enumerate(zip(referenceImages,referenceLocattion)):
-                if i==1: index = location
-                image= image.to(device)
-                image = torch.unsqueeze(image,dim=0)
-                weight,bais = image_model(image)
-                '''
-                $weight = 31.2*\frac{w}{||w||}\cdot feat + 7.2* \frac{b}{||b||}$
-                '''
-                weight = F.normalize(weight, dim=-1)
-                weight = 27.63*weight
-                bais = F.normalize(bais, dim=-1)
-                bais = 4.33*bais
-                weight = torch.matmul(weight,self.token_dict['features'])+bais
-                weight = weight*self.token_dict['std']+self.token_dict['mean']
-                placeholder_token_embed = weight
-                referenceProps.append((placeholder_token_embed,location+1))
-            prompt_embeds = get_prompt_embeds(self,prompt,referenceProps)    
+            for images,locations,prom in zip(referenceImages,referenceLocattion,prompt):
+                referenceProps = []
+                for image,location in zip(images,locations):
+                    image= image.to(device)
+                    image = torch.unsqueeze(image,dim=0)
+                    weight,bais = image_model(image)
+                    '''
+                    $weight = 31.2*\frac{w}{||w||}\cdot feat + 7.2* \frac{b}{||b||}$
+                    '''
+                    weight = F.normalize(weight, dim=-1)
+                    weight = 31.2*weight
+                    bais = F.normalize(bais, dim=-1)
+                    bais = 7.2*bais
+                    weight = torch.matmul(weight,self.token_dict['features'])+bais
+                    weight = weight*self.token_dict['std']+self.token_dict['mean']
+                    placeholder_token_embed = weight
+                    referenceProps.append((placeholder_token_embed,location+1))
+                prompt_embeds.append(get_prompt_embeds(self,prom,referenceProps))
+        prompt_embeds = torch.cat(prompt_embeds,dim = 0) 
         ## 3.2 Encode input prompt
         lora_scale = (
             cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
@@ -1820,10 +1814,7 @@ class BlendedDiffusionPipeline(StableDiffusionPipeline):
         # pixel_values = torch.cat(pixel_values.chunk(reference_len),dim=3)
         # pixel_values = pixel_values.resize_((1,3,height,width))
         scale_range = np.linspace(scale_range[0], scale_range[1], len(self.scheduler.timesteps))
-        img_latents = self.vae.encode(pixel_values.to(device=device,dtype=latents.dtype)).latent_dist.sample()
-        img_latents = img_latents * self.vae.config.scaling_factor
-        # img_latents = torch.cat([img_latents] * 2) if do_classifier_free_guidance else latents
-        noise = latents.clone()
+        
         # noise = torch.repeat_interleave(noise, img_latents.shape[0], dim=0)
         # controller.turn_off()
         # 7. Denoising loop
@@ -1846,8 +1837,6 @@ class BlendedDiffusionPipeline(StableDiffusionPipeline):
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                # referen_latents = torch.zeros_like(latents)
-                noisy_latents = self.scheduler.add_noise(img_latents, noise, t)
                 if i<-1:
                     mask = get_cluter(attention_store,num_segments=5)
                     token_map = cluster2noun(attention_store,mask,[i for i in range(len(prompt.split(' ')))],num_segments=5)
@@ -1857,7 +1846,7 @@ class BlendedDiffusionPipeline(StableDiffusionPipeline):
                     mask = torch.from_numpy(mask).to(device=self._execution_device,dtype=latents.dtype)
                     mask = torch.nn.functional.interpolate(mask.unsqueeze(0).unsqueeze(0), size=(64, 64), mode="nearest")
                     mask = mask.reshape(64,64)
-                    latents = mask*latents+(1-mask)*noisy_latents
+                    latents[1] = mask*latents[0]+(1-mask)*latents[1]
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
                 # call the callback, if provided

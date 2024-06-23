@@ -46,6 +46,8 @@ def run_on_prompt(prompt:Union[str, List[str]],
     if controller is not None:
         if isinstance(controller, AttentionStore):
             ptp_utils.register_attention_control(model, controller)
+        elif isinstance(controller, TextualControl):
+            ptp_utils.register_textual_attention_control(model, controller,last_layer=16)
         else:
             pass
             # ptp_utils.register_textual_attention_control(model, controller)
@@ -68,7 +70,6 @@ def run_on_prompt(prompt:Union[str, List[str]],
                         sd_2_1=config.sd_2_1)
         image = outputs.images[0]
     elif isinstance(model,TextaulandContrPipeline):
-        ptp_utils.register_textual_attention_control(model,controller,last_layer=16)
         outputs = model(prompt=prompt,
                         referenceImages = referenceImages,
                         referenceLocattion = referenceLocattion,
@@ -78,8 +79,10 @@ def run_on_prompt(prompt:Union[str, List[str]],
                         scale_range=config.scale_range,
                         generator=seed,
                         pixel_values=pixel_values,
+                        height = 512,
+                        width = 512,
                         )
-        image = outputs.images[0]
+        image = outputs.images
     elif isinstance(model,BlendedDiffusionPipeline):
         outputs = model(prompt=prompt,
                         referenceImages = referenceImages,
@@ -91,7 +94,7 @@ def run_on_prompt(prompt:Union[str, List[str]],
                         generator=seed,
                         pixel_values=pixel_values,
                         )
-        image = outputs.images[0]
+        image = outputs.images
     elif isinstance(model,TextaulStableDiffusionPipeline):
         outputs = model(prompt=prompt,
                         referenceImages = referenceImages,
@@ -101,7 +104,7 @@ def run_on_prompt(prompt:Union[str, List[str]],
                         guidance_scale = config.guidance_scale,
                         generator=seed,
                         )
-        image = outputs.images[0]
+        image = outputs.images
     elif isinstance(model,TextaulStableDiffusionXLPipeline):
         prompt_2 = prompt
         outputs = model(prompt=prompt,
@@ -114,7 +117,7 @@ def run_on_prompt(prompt:Union[str, List[str]],
                         height=768,
                         width=768,
                         )
-        image = outputs.images[0]
+        image = outputs.images        
     elif isinstance(model,StableDiffusionXLPipeline):
         start_code = torch.randn([1, 4, 128, 128], device=model._execution_device, dtype=model.dtype)
         start_code = start_code.expand(len(prompt), -1, -1, -1)
@@ -130,8 +133,8 @@ def run_on_prompt(prompt:Union[str, List[str]],
         image = outputs.images[-1]
     else:
         prompts = [
-        "A portrait of an old man, facing camera, best quality",
-        "A portrait of an old man, facing camera, smiling, best quality",
+            "A portrait of an old man, facing camera, best quality",
+            "A portrait of an old man, facing camera, smiling, best quality",
         ]
         start_code = torch.randn([1, 4, 64, 64], device=model._execution_device, dtype=model.dtype)
         start_code = start_code.expand(len(prompt), -1, -1, -1)
@@ -144,24 +147,24 @@ def run_on_prompt(prompt:Union[str, List[str]],
                         guidance_scale = config.guidance_scale,
                         latents=start_code,
                         )
-        image = outputs.images[0]
+        image = outputs.images
     return image
 
 @pyrallis.wrap()
 def main(config: RunConfig):
     # from transformers import CLIPTextModel, CLIPTokenizer,CLIPImageProcessor
     root = "/opt/data/private/stable_diffusion_model"
-    textual_name = "textual_inversion_find_mixed_768_1_5"
+    textual_name = "textual_inversion_find_mixed_864_2_1_2"
     # placeholder_token = '<style>'
-    nums_token = 768
+    nums_token = 864
     #"runwayml/stable-diffusion-v1-5"
     #"CompVis/stable-diffusion-v1-4"
     #stabilityai/stable-diffusion-2-1-base
     #stabilityai/stable-diffusion-2-1
     #stabilityai/sd-turbo
     #stabilityai/stable-diffusion-xl-base-1.0
-    model_id = "runwayml/stable-diffusion-v1-5"
-    repo_id = "runwayml/stable-diffusion-v1-5"
+    model_id = "stabilityai/stable-diffusion-2-1"
+    repo_id = "stabilityai/stable-diffusion-2-1"
     name =''
     for x in model_id.split('/'):
         name += x+'_'
@@ -170,14 +173,14 @@ def main(config: RunConfig):
     token_dict = torch.load(save_path)
     bottleneck_dim = token_dict['features'].shape[-1]
 
-    moldel_root = f'{root}/{textual_name}/model.pt'
+    moldel_root = f'{root}/{textual_name}/model_2000.pt'
     state_dict = torch.load(moldel_root)['model']
     backbone = torch.hub.load('facebookresearch/dino:main', 'dino_vitb16',map_location='cpu')
     # head = DINOHead(in_dim=768, out_dim=nums_token,cls_dim=6, nlayers=3)
     head = MLP(in_dim=768, out_dim=nums_token,bottleneck_dim=bottleneck_dim,nlayers=3)
     image_model = torch.nn.Sequential(backbone, head)
     image_model.load_state_dict(state_dict)
-    pipe = TextaulStableDiffusionPipeline.from_pretrained(repo_id,
+    pipe = TextaulandContrPipeline.from_pretrained(repo_id,
                                                     torch_dtype=torch.float16)
     pipe.unet.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
@@ -187,10 +190,24 @@ def main(config: RunConfig):
     setattr(pipe, 'token_dict', token_dict)
     device = torch.device('cuda:0')
     pipe.to(device)
+    
     prompts = [
-            'A dog in the style of #',
-            # 'a photo of a # #',
+            # 'A dog in the style of #',
+            ['A photo of in the style of #.',
+            'A photo of a # in the style of #.',
+            ],
         ]
+    
+    image_path =[
+        # "datasets/Mixed_dataset/cat/cat2.png",
+        "datasets/Mixed_dataset/cat/cat1.png",
+        "datasets/Mixed_dataset/panda/a good photo of a panda_60.jpg",
+        ]
+    
+    token_indices = [
+        [7],
+        [4,9],
+    ]
     referenceText = None
     image_size = 224
     crop_pct = 0.875
@@ -201,10 +218,9 @@ def main(config: RunConfig):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                             std=[0.229, 0.224, 0.225]),])
-    image_path =[
-        "datasets/style_datasets/Fauvism/adam-baltatu_house-on-siret-valley.jpg",
-        # "datasets/style_datasets/Ande/Q.jpg",
-        ]
+    
+    referenceImage0 = []
+    referenceImage1 = []
     referenceImage = []
     image_name = ''
     pixel_values = None
@@ -213,33 +229,37 @@ def main(config: RunConfig):
     for i,path in enumerate(image_path):
         image = Image.open(path)
         image = image.convert("RGB")
-        if i==1:
-            img = image
-            img = np.array(img).astype(np.uint8)
-            img = Image.fromarray(img)
-            img = img.resize((512, 512), resample=Image.BILINEAR)
-            img= np.array(img).astype(np.uint8)
-            img = (img / 127.5 - 1.0).astype(np.float32)
-            pixel_value = torch.from_numpy(img).permute(2, 0, 1)
-            pixel_value = pixel_value.unsqueeze(0)
-            pixel_values = pixel_value
-            # continue
+        # img = image
+        # img = np.array(img).astype(np.uint8)
+        # img = Image.fromarray(img)
+        # img = img.resize((512, 512), resample=Image.BILINEAR)
+        # img= np.array(img).astype(np.uint8)
+        # img = (img / 127.5 - 1.0).astype(np.float32)
+        # pixel_value = torch.from_numpy(img).permute(2, 0, 1)
+        # pixel_value = pixel_value.unsqueeze(0)
+        # pixel_values.append(pixel_value)
         image_name +=(path.split('/')[-2].split('.')[0]+'_')
-        referenceImage.append(trans(image))
-    if pixel_values is not None:
-        pixel_values = pixel_values.to(device)
-    token_indices = [6]
+        img = trans(image)
+        if i == 1:
+            referenceImage0.append(img)
+        referenceImage1.append(img)
+    assert len(referenceImage0) == len(token_indices[0]), "The number of reference images should be the same as the number of token_indices"
+    assert len(referenceImage1) == len(token_indices[1]), "The number of reference images should be the same as the number of token_indices"
+    referenceImage.append(referenceImage0)
+    referenceImage.append(referenceImage1)
+    
     indices_to_alter = [5]
     # referenceImage =[]
     # token_indices = []
-    controller = AttentionStore()
+    # controller = AttentionStore()
     # controller = TextualControl()
-    # controller = None
+    controller = None
     for prompt in prompts:
-        os.makedirs(f"./images/{textual_name}/{prompt}",exist_ok=True)
-        for seed in range(0,5):
+        for i in range(len(prompt)):
+            os.makedirs(f"./images/{textual_name}/{prompt[i]}",exist_ok=True)
+        for seed in range(6,10):
             g = torch.Generator('cuda').manual_seed(seed)
-            image = run_on_prompt(prompt=prompt,
+            images = run_on_prompt(prompt=prompt,
                                 model=pipe,
                                 controller=controller,
                                 indices_to_alter = indices_to_alter,
@@ -249,7 +269,8 @@ def main(config: RunConfig):
                                 referenceLocattion = token_indices,
                                 referenceText = referenceText,
                                 pixel_values=pixel_values)
-            image.save(f"./images/{textual_name}/{prompt}/{image_name}{seed}.png")
+            for i,image in enumerate(images):
+                image.save(f"./images/{textual_name}/{prompt[i]}/{image_name}_{seed}.png")
 
 if __name__ == '__main__':
     main()

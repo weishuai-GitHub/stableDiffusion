@@ -20,3 +20,10 @@ textual_inversion_style_2
 token_dict
 outputs
 model
+sdxl
+result
+textual_inversion_data
+add_noise
+draw.py
+com_emp.sh
+result.py

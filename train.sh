@@ -4,10 +4,10 @@
 # runwayml/stable-diffusion-v1-5
 # CompVis/stable-diffusion-v1-4
 # stabilityai/stable-diffusion-xl-base-1.0
-export MODEL_NAME="runwayml/stable-diffusion-v1-5"
-export DATA_DIR="datasets/style_datasets"
+export MODEL_NAME="stabilityai/stable-diffusion-2-1"
+export DATA_DIR="datasets/Mixed_dataset"
 ROOT="/opt/data/private/stable_diffusion_model"
-DIR="textual_inversion_find_mixed_768_1_5"
+DIR="textual_inversion_find_mixed_864_2_1_2"
 CUDA_VISIBLE_DEVICES=0,1 
 accelerate launch main.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
@@ -25,11 +25,11 @@ accelerate launch main.py \
   --lr_scheduler="constant" \
   --dataloader_num_workers=0 \
   --lr_warmup_steps=0 \
-  --out_dim=768 \
-  --cls_dim=5 \
+  --out_dim=864 \
+  --cls_dim=10 \
   --repeats 100 \
   --unlabelled 11 \
-  --style_name "Ande Cubism Cute Fauvism Landscape_painting" \
+  --style_name "Ande Cubism Cute Fauvism Gta5 Landscape_painting" \
   --output_dir=${ROOT}/${DIR}
 
 # export MODEL_NAME=stabilityai/stable-diffusion-2-1-base
