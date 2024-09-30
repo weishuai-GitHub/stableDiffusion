@@ -9,7 +9,6 @@ import sys
 curr_path = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(curr_path)
 from ptp_utils import AttentionBase
-
 from torchvision.utils import save_image
 
 

@@ -11,8 +11,8 @@ from util.model import DINOHead,MLP
 # from safetensors import safe_open
 from diffusers import (
     # AutoencoderKL,
-    DDIMScheduler,
-    DDIMInverseScheduler,
+    # DDIMScheduler,
+    # DDIMInverseScheduler,
     StableDiffusionPipeline,
     StableDiffusionXLPipeline
     # UNet2DConditionModel,
@@ -201,7 +201,7 @@ def main(config: RunConfig):
     image_path =[
         # "datasets/Mixed_dataset/cat/cat2.png",
         "datasets/Mixed_dataset/cat/cat1.png",
-        "datasets/Mixed_dataset/panda/a good photo of a panda_60.jpg",
+        "datasets/Mixed_dataset/teddybear/marina-shatskih-kBo2MFJz2QU-unsplash.jpg",
         ]
     
     token_indices = [
@@ -251,13 +251,11 @@ def main(config: RunConfig):
     indices_to_alter = [5]
     # referenceImage =[]
     # token_indices = []
-    # controller = AttentionStore()
-    # controller = TextualControl()
-    controller = None
+    controller = TextualControl(AttentionStore())
     for prompt in prompts:
         for i in range(len(prompt)):
             os.makedirs(f"./images/{textual_name}/{prompt[i]}",exist_ok=True)
-        for seed in range(6,10):
+        for seed in range(10,20):
             g = torch.Generator('cuda').manual_seed(seed)
             images = run_on_prompt(prompt=prompt,
                                 model=pipe,

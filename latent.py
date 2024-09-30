@@ -9,7 +9,7 @@ from PIL import Image
 import numpy as np
 import torch
 device = 'cuda'
-model_id = 'CompVis/stable-diffusion-v1-4'
+model_id = 'stabilityai/stable-diffusion-2-1'
 model = StableDiffusionPipeline.from_pretrained(model_id)
 model = model.to(device)
 vae = model.vae
@@ -33,7 +33,7 @@ def get_latent(image,t,noises):
     noises_latent = scheduler.add_noise(latent, noises, t)
     return noises_latent
 
-image_path = 'datasets/sample_dataset/panda/a good photo of a panda_613.jpg'
+image_path = 'datasets/class_datasets/panda/a bright photo of the panda_274.jpg'
 
 image = Image.open(image_path)
 image = image.convert("RGB")
@@ -46,7 +46,7 @@ img= np.array(img).astype(np.uint8)
 img = (img / 127.5 - 1.0).astype(np.float32)
 pixel_value = torch.from_numpy(img).permute(2, 0, 1)
 pixel_value = pixel_value.unsqueeze(0)
-name = image_path.split('/')[-2]
+name = image_path.split('/')[-2]+"_2"
 scheduler.set_timesteps(50, device='cuda')
 controller = AttentionStore()
 register_attention_control(model,controller)

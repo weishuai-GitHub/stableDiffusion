@@ -305,15 +305,177 @@ class StoreLossControl:
         if self.cur_step == self.total_step:
             self.loss /= self.total_step
 
-class TextualCrossAttnProcessor:
+class AttentionControl(abc.ABC):
+
+    def step_callback(self, x_t):
+        return x_t
+
+    def between_steps(self):
+        return
+
+    # @property
+    # def num_uncond_att_layers(self):
+    #     return 0
+
+    @abc.abstractmethod
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
+        raise NotImplementedError
+
+    def __call__(self, attn, is_cross: bool, place_in_unet: str):
+        if self.cur_att_layer >= self.num_uncond_att_layers:
+            self.forward(attn, is_cross, place_in_unet)
+        self.cur_att_layer += 1
+        if self.cur_att_layer == self.num_att_layers + self.num_uncond_att_layers:
+            self.cur_att_layer = 0
+            self.cur_step += 1
+            self.between_steps()
+
+    def reset(self):
+        self.cur_step = 0
+        self.cur_att_layer = 0
+
+    def __init__(self):
+        self.cur_step = 0
+        self.num_att_layers = -1
+        self.cur_att_layer = 0
+
+class EmptyControl(AttentionControl):
+
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
+        return attn
+
+class AttentionStore(AttentionControl):
+
+    @staticmethod
+    def get_empty_store():
+        return {"down_cross": [], "mid_cross": [], "up_cross": [],
+                "down_self": [], "mid_self": [], "up_self": []}
+
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
+        key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
+        if attn.shape[1] <= 32 ** 2:  # avoid memory overhead
+            self.step_store[key].append(attn)
+        return attn
+
+    def between_steps(self):
+        self.attention_store = self.step_store
+        if self.save_global_store:
+            with torch.no_grad():
+                if len(self.global_store) == 0:
+                    self.global_store = self.step_store
+                else:
+                    for key in self.global_store:
+                        for i in range(len(self.global_store[key])):
+                            self.global_store[key][i] += self.step_store[key][i].detach()
+        self.step_store = self.get_empty_store()
+        # self.step_store = self.get_empty_store()
+
+    def get_average_attention(self):
+        average_attention = self.attention_store
+        return average_attention
+
+    def get_average_global_attention(self):
+        average_attention = {key: [item / self.cur_step for item in self.global_store[key]] for key in
+                             self.attention_store}
+        return average_attention
+
+    def reset(self):
+        super(AttentionStore, self).reset()
+        self.step_store = self.get_empty_store()
+        self.attention_store = {}
+        self.global_store = {}
+
+    def __init__(self, save_global_store=False):
+        '''
+        Initialize an empty AttentionStore
+        :param step_index: used to visualize only a specific step in the diffusion process
+        '''
+        super(AttentionStore, self).__init__()
+        self.save_global_store = save_global_store
+        self.step_store = self.get_empty_store()
+        self.attention_store = {}
+        self.global_store = {}
+        self.curr_step_index = 0
+        self.num_uncond_att_layers = 0
+
+def aggregate_attention(attention_store: AttentionStore,
+                        res: int,
+                        from_where: List[str],
+                        is_cross: bool,
+                        select: int) -> torch.Tensor:
+    """ Aggregates the attention across the different layers and heads at the specified resolution. """
+    out = []
+    attention_maps = attention_store.get_average_attention()
+
+    num_pixels = res ** 2
+    for location in from_where:
+        for item in attention_maps[f"{location}_{'cross' if is_cross else 'self'}"]:
+            if item.shape[1] == num_pixels:
+                cross_maps = item.reshape(1, -1, res, res, item.shape[-1])[select]
+                out.append(cross_maps)
+    out = torch.cat(out, dim=0)
+    out = out.sum(0) / out.shape[0]
+    return out
+
+def register_attention_control(model, controller:AttentionStore):
+
+    attn_procs = {}
+    cross_att_count = 0
+    # attn_processors_key = []
+    # for name ,key in model.unet.named_parameters():
+    #     if 'attentions' in name:
+    #         attn_processors_key.append(name)
+    for name in model.unet.attn_processors.keys():
+        cross_attention_dim = None if name.endswith("attn1.processor") else model.unet.config.cross_attention_dim
+        if name.startswith("mid_block"):
+            hidden_size = model.unet.config.block_out_channels[-1]
+            place_in_unet = "mid"
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks.")])
+            hidden_size = list(reversed(model.unet.config.block_out_channels))[block_id]
+            place_in_unet = "up"
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks.")])
+            hidden_size = model.unet.config.block_out_channels[block_id]
+            place_in_unet = "down"
+        else:
+            continue
+
+        cross_att_count += 1
+        attn_procs[name] = AttendExciteCrossAttnProcessor(
+            attnstore=controller, place_in_unet=place_in_unet
+        )
+    model.unet.set_attn_processor(attn_procs)
+    controller.num_att_layers = cross_att_count
+
+class TextualControl:
+    def __init__(self,attentionStore:AttentionStore = None):
+        self.is_edit=True
+        self.attentionStore = attentionStore
+    def turn_off(self):
+        self.is_edit=False
+
+    def turn_on(self):
+        self.is_edit=True
+
+    def __call__(self, query:torch.Tensor,key:torch.Tensor,value:torch.Tensor) -> \
+    Tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
+        if self.is_edit:
+            key[1,:] = key[0,:]
+            value[1,:] = value[0,:]
+            print(query.shape,key.shape,value.shape)
+        return query,key,value
+
+class TextualAttnProcessor:
     MODEL_TYPE = {
         "SD": 16,
         "SDXL": 70
     }
-    def __init__(self,place_in_unet,controller,cross_layer:int=0,self_layer:int=0,last_layer:int=16,
+    def __init__(self,place_in_unet,controller:TextualControl,cross_layer:int=0,self_layer:int=0,last_layer:int=16,
                 alph:float = 0.5,model_type= 'SD',attention_op: Optional[Callable] = None) -> None:
         self.place_in_unet = place_in_unet
         self.controller = controller
+        self.attentionStore = controller.attentionStore
         self.cross_layer = cross_layer
         self.self_layer = self_layer
         self.attention_op = attention_op
@@ -321,19 +483,14 @@ class TextualCrossAttnProcessor:
         self.last_layer = min(last_layer,self.total_layers)
         self.alph = alph
         self.is_query = True
-        
-        
-        self.key = None
-        self.query = None
-        self.value = None
     
-    def reset(self):
-        self.is_query = True
-        self.query = None
-        self.key = None
-        self.value = None
-    def __call__(self, attn: Attention, hidden_states, 
-                encoder_hidden_states=None, attention_mask=None,temb=None):
+    def __call__(self, 
+                attn: Attention,
+                hidden_states: torch.FloatTensor,
+                encoder_hidden_states: Optional[torch.FloatTensor] = None,
+                attention_mask: Optional[torch.FloatTensor] = None,
+                temb: Optional[torch.FloatTensor] = None,
+        ) -> torch.Tensor:
         
         residual = hidden_states
 
@@ -348,27 +505,37 @@ class TextualCrossAttnProcessor:
         batch_size, sequence_length, _ = (
             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
         )
-        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size=1)
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
         if attn.group_norm is not None:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+        
         is_cross = encoder_hidden_states is not None
+        query = attn.to_q(hidden_states)
         
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
         elif attn.norm_cross:
             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
         
-        query,key,value = self.controller.forward(self,attn, is_cross,hidden_states,encoder_hidden_states)
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
 
+        assert query.shape[0] == 2, f"query shape is {query.shape}, but should be [2,_]"
+
+        # self-attention control
+        if not is_cross and self.self_layer < self.last_layer: 
+            query,key,value = self.controller(query,key,value)
+        
         query = attn.head_to_batch_dim(query)
         key = attn.head_to_batch_dim(key)
         value = attn.head_to_batch_dim(value)
 
-        # attention_probs = attn.get_attention_scores(query, key, attention_mask)
-        # hidden_states = torch.bmm(attention_probs, value)
-        # hidden_states = F.scaled_dot_product_attention(
-        #     query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        # )
+        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+
+        # 取第一个promt作为query
+        # get attention_probs to store
+        self.attentionStore(attention_probs, is_cross, self.place_in_unet)
+
         hidden_states = xformers.ops.memory_efficient_attention(
             query, key, value, attn_bias=attention_mask, op=self.attention_op, scale=attn.scale
         )
@@ -390,42 +557,6 @@ class TextualCrossAttnProcessor:
 
         return hidden_states
 
-class TextualControl:
-    def __init__(self):
-        super().__init__()
-        self.cross_att_layer = 0
-        self.self_att_layer = 0
-        self.is_edit=True
-        self.name=None
-    def turn_off(self):
-        self.is_edit=False
-    def turn_on(self):
-        self.is_edit=True
-    def forward(self,processor:TextualCrossAttnProcessor,attn: Attention, is_cross:bool,hidden_states,encoder_hidden_states):
-        if self.is_edit:
-            if  is_cross and processor.self_layer<processor.last_layer and not processor.is_query :
-                query = processor.query
-                # key = processor.key
-                # value = processor.value
-                processor.reset()
-            elif is_cross and processor.self_layer<processor.last_layer and processor.is_query:
-                query = attn.to_q(hidden_states)
-                processor.query = query
-                # key = attn.to_k(encoder_hidden_states)
-                # processor.key = key
-                # value = attn.to_v(encoder_hidden_states)
-                # processor.value = value
-                processor.is_query = False
-            else:
-                query = attn.to_q(hidden_states)
-            key = attn.to_k(encoder_hidden_states)
-            value = attn.to_v(encoder_hidden_states)
-        else:
-            query = attn.to_q(hidden_states)
-            key = attn.to_k(encoder_hidden_states)
-            value = attn.to_v(encoder_hidden_states)
-        return query,key,value
-
 def register_textual_attention_control(model,controller=None,last_layer:int=16,model_type= 'SD'):
     cross_layer = 0
     self_layer = 0
@@ -446,12 +577,12 @@ def register_textual_attention_control(model,controller=None,last_layer:int=16,m
         else:
             continue
         if cross_attention_dim==None:
-            Processor[name] = TextualCrossAttnProcessor(
+            Processor[name] = TextualAttnProcessor(
             place_in_unet=place_in_unet,controller=controller,self_layer=self_layer,
             last_layer=last_layer,model_type=model_type)
             self_layer+=1
         else:
-            Processor[name] = TextualCrossAttnProcessor(
+            Processor[name] = TextualAttnProcessor(
                 place_in_unet=place_in_unet,controller=controller,cross_layer=cross_layer,
                 last_layer=last_layer,model_type=model_type)
             cross_layer+=1
@@ -761,149 +892,6 @@ class TextualInversionXLDataset(ImageFolder):
         example["index"] = torch.where(example["input_ids_1"] == placeholder_token_id)[0][0]
         return example
 
-def register_attention_control(model, controller):
-
-    attn_procs = {}
-    cross_att_count = 0
-    # attn_processors_key = []
-    # for name ,key in model.unet.named_parameters():
-    #     if 'attentions' in name:
-    #         attn_processors_key.append(name)
-    for name in model.unet.attn_processors.keys():
-        cross_attention_dim = None if name.endswith("attn1.processor") else model.unet.config.cross_attention_dim
-        if name.startswith("mid_block"):
-            hidden_size = model.unet.config.block_out_channels[-1]
-            place_in_unet = "mid"
-        elif name.startswith("up_blocks"):
-            block_id = int(name[len("up_blocks.")])
-            hidden_size = list(reversed(model.unet.config.block_out_channels))[block_id]
-            place_in_unet = "up"
-        elif name.startswith("down_blocks"):
-            block_id = int(name[len("down_blocks.")])
-            hidden_size = model.unet.config.block_out_channels[block_id]
-            place_in_unet = "down"
-        else:
-            continue
-
-        cross_att_count += 1
-        attn_procs[name] = AttendExciteCrossAttnProcessor(
-            attnstore=controller, place_in_unet=place_in_unet
-        )
-    model.unet.set_attn_processor(attn_procs)
-    controller.num_att_layers = cross_att_count
-
-class AttentionControl(abc.ABC):
-
-    def step_callback(self, x_t):
-        return x_t
-
-    def between_steps(self):
-        return
-
-    # @property
-    # def num_uncond_att_layers(self):
-    #     return 0
-
-    @abc.abstractmethod
-    def forward(self, attn, is_cross: bool, place_in_unet: str):
-        raise NotImplementedError
-
-    def __call__(self, attn, is_cross: bool, place_in_unet: str):
-        if self.cur_att_layer >= self.num_uncond_att_layers:
-            self.forward(attn, is_cross, place_in_unet)
-        self.cur_att_layer += 1
-        if self.cur_att_layer == self.num_att_layers + self.num_uncond_att_layers:
-            self.cur_att_layer = 0
-            self.cur_step += 1
-            self.between_steps()
-
-    def reset(self):
-        self.cur_step = 0
-        self.cur_att_layer = 0
-
-    def __init__(self):
-        self.cur_step = 0
-        self.num_att_layers = -1
-        self.cur_att_layer = 0
-
-class EmptyControl(AttentionControl):
-
-    def forward(self, attn, is_cross: bool, place_in_unet: str):
-        return attn
-
-class AttentionStore(AttentionControl):
-
-    @staticmethod
-    def get_empty_store():
-        return {"down_cross": [], "mid_cross": [], "up_cross": [],
-                "down_self": [], "mid_self": [], "up_self": []}
-
-    def forward(self, attn, is_cross: bool, place_in_unet: str):
-        key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
-        if attn.shape[1] <= 32 ** 2:  # avoid memory overhead
-            self.step_store[key].append(attn)
-        return attn
-
-    def between_steps(self):
-        self.attention_store = self.step_store
-        if self.save_global_store:
-            with torch.no_grad():
-                if len(self.global_store) == 0:
-                    self.global_store = self.step_store
-                else:
-                    for key in self.global_store:
-                        for i in range(len(self.global_store[key])):
-                            self.global_store[key][i] += self.step_store[key][i].detach()
-        self.step_store = self.get_empty_store()
-        # self.step_store = self.get_empty_store()
-
-    def get_average_attention(self):
-        average_attention = self.attention_store
-        return average_attention
-
-    def get_average_global_attention(self):
-        average_attention = {key: [item / self.cur_step for item in self.global_store[key]] for key in
-                             self.attention_store}
-        return average_attention
-
-    def reset(self):
-        super(AttentionStore, self).reset()
-        self.step_store = self.get_empty_store()
-        self.attention_store = {}
-        self.global_store = {}
-
-    def __init__(self, save_global_store=False):
-        '''
-        Initialize an empty AttentionStore
-        :param step_index: used to visualize only a specific step in the diffusion process
-        '''
-        super(AttentionStore, self).__init__()
-        self.save_global_store = save_global_store
-        self.step_store = self.get_empty_store()
-        self.attention_store = {}
-        self.global_store = {}
-        self.curr_step_index = 0
-        self.num_uncond_att_layers = 0
-
-
-def aggregate_attention(attention_store: AttentionStore,
-                        res: int,
-                        from_where: List[str],
-                        is_cross: bool,
-                        select: int) -> torch.Tensor:
-    """ Aggregates the attention across the different layers and heads at the specified resolution. """
-    out = []
-    attention_maps = attention_store.get_average_attention()
-
-    num_pixels = res ** 2
-    for location in from_where:
-        for item in attention_maps[f"{location}_{'cross' if is_cross else 'self'}"]:
-            if item.shape[1] == num_pixels:
-                cross_maps = item.reshape(1, -1, res, res, item.shape[-1])[select]
-                out.append(cross_maps)
-    out = torch.cat(out, dim=0)
-    out = out.sum(0) / out.shape[0]
-    return out
 
 class AttentionBase:
     def __init__(self):
@@ -968,73 +956,6 @@ class MasaAttentionStore(AttentionBase):
                 self.self_attns_step.append(attn)
         return super().forward(q, k, v, sim, attn, is_cross, place_in_unet, num_heads, **kwargs)
 
-
-def regiter_attention_editor_diffusers(model, editor: AttentionBase):
-    """
-    Register a attention editor to Diffuser Pipeline, refer from [Prompt-to-Prompt]
-    """
-    def ca_forward(self, place_in_unet):
-        def forward(x, encoder_hidden_states=None, attention_mask=None, context=None, mask=None):
-            """
-            The attention is similar to the original implementation of LDM CrossAttention class
-            except adding some modifications on the attention
-            """
-            if encoder_hidden_states is not None:
-                context = encoder_hidden_states
-            if attention_mask is not None:
-                mask = attention_mask
-
-            to_out = self.to_out
-            if isinstance(to_out, nn.modules.container.ModuleList):
-                to_out = self.to_out[0]
-            else:
-                to_out = self.to_out
-
-            h = self.heads
-            q = self.to_q(x)
-            is_cross = context is not None
-            context = context if is_cross else x
-            k = self.to_k(context)
-            v = self.to_v(context)
-            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
-
-            sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
-
-            if mask is not None:
-                mask = rearrange(mask, 'b ... -> b (...)')
-                max_neg_value = -torch.finfo(sim.dtype).max
-                mask = repeat(mask, 'b j -> (b h) () j', h=h)
-                mask = mask[:, None, :].repeat(h, 1, 1)
-                sim.masked_fill_(~mask, max_neg_value)
-
-            attn = sim.softmax(dim=-1)
-            # the only difference
-            out = editor(
-                q, k, v, sim, attn, is_cross, place_in_unet,
-                self.heads, scale=self.scale)
-
-            return to_out(out)
-
-        return forward
-
-    def register_editor(net, count, place_in_unet):
-        for name, subnet in net.named_children():
-            if net.__class__.__name__ == 'Attention':  # spatial Transformer layer
-                net.forward = ca_forward(net, place_in_unet)
-                return count + 1
-            elif hasattr(net, 'children'):
-                count = register_editor(subnet, count, place_in_unet)
-        return count
-
-    cross_att_count = 0
-    for net_name, net in model.unet.named_children():
-        if "down" in net_name:
-            cross_att_count += register_editor(net, 0, "down")
-        elif "mid" in net_name:
-            cross_att_count += register_editor(net, 0, "mid")
-        elif "up" in net_name:
-            cross_att_count += register_editor(net, 0, "up")
-    editor.num_att_layers = cross_att_count
 
 def regiter_attention_editor_diffusers(model, editor: AttentionBase):
     """

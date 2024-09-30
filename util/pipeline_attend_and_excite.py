@@ -1619,7 +1619,7 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
 
         scale_range = np.linspace(scale_range[0], scale_range[1], len(self.scheduler.timesteps))
         
-        # controller.turn_off()
+        controller.turn_on()
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -1645,7 +1645,15 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
                 if i<10:
-                    latents[1] = latents[1] + 1.0* (latents[0] -latents[1])
+                    mask = get_cluter(controller.attentionStore,num_segments=5)
+                    token_map = cluster2noun(controller.attentionStore,mask,[i for i in range(len(prompt.split(' ')))],num_segments=5)
+                    background_mask = get_background_mask(mask,token_map,num_segments=5)
+                    mask = np.zeros_like(background_mask)
+                    mask[background_mask==0] =1
+                    mask = torch.from_numpy(mask).to(device=self._execution_device,dtype=latents.dtype)
+                    mask = torch.nn.functional.interpolate(mask.unsqueeze(0).unsqueeze(0), size=(64, 64), mode="nearest")
+                    mask = mask.reshape(64,64)
+                    latents[1] = mask*latents[0]+(1-mask)*latents[1]
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
@@ -1837,7 +1845,7 @@ class BlendedDiffusionPipeline(StableDiffusionPipeline):
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                if i<-1:
+                if i<10:
                     mask = get_cluter(attention_store,num_segments=5)
                     token_map = cluster2noun(attention_store,mask,[i for i in range(len(prompt.split(' ')))],num_segments=5)
                     background_mask = get_background_mask(mask,token_map,num_segments=5)
