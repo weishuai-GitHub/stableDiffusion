@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from IPython.display import display
 from PIL import Image
-from typing import Any, Callable, Union, Tuple, List
+from typing import Any, Callable, Dict, Union, Tuple, List
 from diffusers.models.attention import Attention
 from transformers import CLIPTextModel
 from transformers.modeling_outputs import BaseModelOutputWithPooling
@@ -19,7 +19,12 @@ from packaging import version
 import random
 from einops import rearrange, repeat
 from util.transforms import get_strong_aug
+from diffusers.utils.constants import *
 from diffusers.utils.import_utils import is_xformers_available
+from diffusers.models.attention import BasicTransformerBlock,_chunked_feed_forward
+from diffusers.models.resnet import ResnetBlock2D
+from diffusers.models.upsampling import Upsample2D
+from diffusers.models.downsampling import Downsample2D
 from torch import nn
 from torch.nn import functional as F
 # from torch import nn 
@@ -139,6 +144,7 @@ def view_images(images: Union[np.ndarray, List],
     if display_image:
         display(pil_img)
     return pil_img
+
 
 class AttendExciteCrossAttnProcessor:
 
@@ -448,22 +454,37 @@ def register_attention_control(model, controller:AttentionStore):
     model.unet.set_attn_processor(attn_procs)
     controller.num_att_layers = cross_att_count
 
+
+# imgae edit control
 class TextualControl:
-    def __init__(self,attentionStore:AttentionStore = None):
+    def __init__(self,
+        attentionStore:AttentionStore = None,
+        alph:float = 1.0,
+        ) -> None:
         self.is_edit=True
         self.attentionStore = attentionStore
+        self.alph = alph
+
     def turn_off(self):
         self.is_edit=False
 
     def turn_on(self):
         self.is_edit=True
 
-    def __call__(self, query:torch.Tensor,key:torch.Tensor,value:torch.Tensor) -> \
-    Tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
-        if self.is_edit:
-            key[1,:] = key[0,:]
-            value[1,:] = value[0,:]
-            print(query.shape,key.shape,value.shape)
+    def __call__(self, 
+        query:torch.Tensor,
+        key:torch.Tensor,
+        value:torch.Tensor,
+        is_cross:bool,
+        ) ->Tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
+        if self.is_edit and not is_cross:
+            
+            value[1,:] = self.alph*value[0,:] + (1- self.alph)*value[1,:]
+            key[1,:] = self.alph*key[0,:] + (1- self.alph)*key[1,:]
+            
+            value[3,:] = self.alph*value[2,:] + (1- self.alph)*value[3,:]
+            key[3,:] = self.alph*key[2,:] + (1- self.alph)*key[3,:]
+            # print(query.shape,key.shape,value.shape)
         return query,key,value
 
 class TextualAttnProcessor:
@@ -481,8 +502,7 @@ class TextualAttnProcessor:
         self.attention_op = attention_op
         self.total_layers = self.MODEL_TYPE.get(model_type, 16)
         self.last_layer = min(last_layer,self.total_layers)
-        self.alph = alph
-        self.is_query = True
+        
     
     def __call__(self, 
                 attn: Attention,
@@ -520,20 +540,26 @@ class TextualAttnProcessor:
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
 
-        assert query.shape[0] == 2, f"query shape is {query.shape}, but should be [2,_]"
+        assert query.shape[0] == 4, f"query shape is {query.shape}, but should be [4,_]"
 
         # self-attention control
-        if not is_cross and self.self_layer < self.last_layer: 
-            query,key,value = self.controller(query,key,value)
+        if self.self_layer < self.last_layer or self.cross_layer < self.last_layer: 
+            query,key,value = self.controller(query,key,value,is_cross)
+        
         
         query = attn.head_to_batch_dim(query)
         key = attn.head_to_batch_dim(key)
         value = attn.head_to_batch_dim(value)
 
-        attention_probs = attn.get_attention_scores(query, key, attention_mask)
-
+        
         # 取第一个promt作为query
         # get attention_probs to store
+        q_shape = query.shape
+        k_shape = key.shape
+        # am_shape = attention_mask.shape
+        attention_probs = attn.get_attention_scores(query[:q_shape[0] //4,:,:], 
+                                                    key[:k_shape[0]  //4,:,:], 
+                                                    )
         self.attentionStore(attention_probs, is_cross, self.place_in_unet)
 
         hidden_states = xformers.ops.memory_efficient_attention(
@@ -557,10 +583,111 @@ class TextualAttnProcessor:
 
         return hidden_states
 
-def register_textual_attention_control(model,controller=None,last_layer:int=16,model_type= 'SD'):
+def co_forward(self:ResnetBlock2D,controller:TextualControl):
+    def forward(
+        input_tensor: torch.FloatTensor,
+        temb: torch.FloatTensor,
+        scale: float = 1.0,
+    ) -> torch.FloatTensor:
+        hidden_states = input_tensor
+
+        if self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
+            hidden_states = self.norm1(hidden_states, temb)
+        else:
+            hidden_states = self.norm1(hidden_states)
+
+        hidden_states = self.nonlinearity(hidden_states)
+
+        if self.upsample is not None:
+            # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
+            if hidden_states.shape[0] >= 64:
+                input_tensor = input_tensor.contiguous()
+                hidden_states = hidden_states.contiguous()
+            input_tensor = (
+                self.upsample(input_tensor, scale=scale)
+                if isinstance(self.upsample, Upsample2D)
+                else self.upsample(input_tensor)
+            )
+            hidden_states = (
+                self.upsample(hidden_states, scale=scale)
+                if isinstance(self.upsample, Upsample2D)
+                else self.upsample(hidden_states)
+            )
+        elif self.downsample is not None:
+            input_tensor = (
+                self.downsample(input_tensor, scale=scale)
+                if isinstance(self.downsample, Downsample2D)
+                else self.downsample(input_tensor)
+            )
+            hidden_states = (
+                self.downsample(hidden_states, scale=scale)
+                if isinstance(self.downsample, Downsample2D)
+                else self.downsample(hidden_states)
+            )
+
+        hidden_states = self.conv1(hidden_states, scale) if not USE_PEFT_BACKEND else self.conv1(hidden_states)
+
+        if self.time_emb_proj is not None:
+            if not self.skip_time_act:
+                temb = self.nonlinearity(temb)
+            temb = (
+                self.time_emb_proj(temb, scale)[:, :, None, None]
+                if not USE_PEFT_BACKEND
+                else self.time_emb_proj(temb)[:, :, None, None]
+            )
+
+        if temb is not None and self.time_embedding_norm == "default":
+            hidden_states = hidden_states + temb
+
+        if self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
+            hidden_states = self.norm2(hidden_states, temb)
+        else:
+            hidden_states = self.norm2(hidden_states)
+
+        if temb is not None and self.time_embedding_norm == "scale_shift":
+            scale, shift = torch.chunk(temb, 2, dim=1)
+            hidden_states = hidden_states * (1 + scale) + shift
+
+        hidden_states = self.nonlinearity(hidden_states)
+
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.conv2(hidden_states, scale) if not USE_PEFT_BACKEND else self.conv2(hidden_states)
+        # print(f"controller isedit = {controller.is_edit}")
+        if controller.is_edit:
+            hidden_states[1] = hidden_states[0]
+            hidden_states[3] = hidden_states[2]
+
+        if self.conv_shortcut is not None:
+            input_tensor = (
+                self.conv_shortcut(input_tensor, scale) if not USE_PEFT_BACKEND else self.conv_shortcut(input_tensor)
+            )
+        output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
+        
+
+        return output_tensor
+    return forward
+
+
+def register_textual_attention_control(model,controller:TextualControl=None,last_layer:int=16,model_type= 'SD'):
+    
+    # injection Residual Block
+    layers = []
+    # for downsample_block in model.unet.down_blocks:
+    #     if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
+    #         for resnet in downsample_block.resnets:
+    #             layers.append(resnet)
+    if hasattr(model.unet.mid_block, "has_cross_attention") and model.unet.mid_block.has_cross_attention:        
+        for resnet in model.unet.mid_block.resnets[1:]:
+            layers.append(resnet)
+    # for upsample_block in model.unet.up_blocks:
+    #     if hasattr(upsample_block, "has_cross_attention") and upsample_block.has_cross_attention:
+    #         for resnet in upsample_block.resnets:
+    #             layers.append(resnet)
+
     cross_layer = 0
     self_layer = 0
     Processor = {}
+    cross_att_count  = 0
     for name in model.unet.attn_processors.keys():
         cross_attention_dim = None if name.endswith("attn1.processor") else model.unet.config.cross_attention_dim
         if name.startswith("mid_block"):
@@ -576,6 +703,7 @@ def register_textual_attention_control(model,controller=None,last_layer:int=16,m
             place_in_unet = "down"
         else:
             continue
+        cross_att_count += 1
         if cross_attention_dim==None:
             Processor[name] = TextualAttnProcessor(
             place_in_unet=place_in_unet,controller=controller,self_layer=self_layer,
@@ -587,6 +715,9 @@ def register_textual_attention_control(model,controller=None,last_layer:int=16,m
                 last_layer=last_layer,model_type=model_type)
             cross_layer+=1
     model.unet.set_attn_processor(Processor)
+    controller.attentionStore.num_att_layers = cross_att_count
+    setattr(layers[0], "forward", co_forward(layers[0],controller))
+
 
 class TextualCLIPTextModel(CLIPTextModel):
     def forward(

@@ -193,20 +193,21 @@ def main(config: RunConfig):
     
     prompts = [
             # 'A dog in the style of #',
-            ['A photo of in the style of #.',
-            'A photo of a # in the style of #.',
+            [
+            'A good photo of a # on the beach',
+            'A good photo of a beach in the style of #',
             ],
         ]
     
     image_path =[
         # "datasets/Mixed_dataset/cat/cat2.png",
         "datasets/Mixed_dataset/cat/cat1.png",
-        "datasets/Mixed_dataset/teddybear/marina-shatskih-kBo2MFJz2QU-unsplash.jpg",
+        "datasets/Mixed_dataset/Fauvism/adam-baltatu_house-on-siret-valley.jpg",
         ]
     
     token_indices = [
-        [7],
-        [4,9],
+        [5],
+        [10],
     ]
     referenceText = None
     image_size = 224
@@ -223,26 +224,27 @@ def main(config: RunConfig):
     referenceImage1 = []
     referenceImage = []
     image_name = ''
-    pixel_values = None
+    pixel_values = []
     # mask = torch.zeros([768, 768])
     # mask[568:668, 568:668] = 1
     for i,path in enumerate(image_path):
         image = Image.open(path)
         image = image.convert("RGB")
-        # img = image
-        # img = np.array(img).astype(np.uint8)
-        # img = Image.fromarray(img)
-        # img = img.resize((512, 512), resample=Image.BILINEAR)
-        # img= np.array(img).astype(np.uint8)
-        # img = (img / 127.5 - 1.0).astype(np.float32)
-        # pixel_value = torch.from_numpy(img).permute(2, 0, 1)
-        # pixel_value = pixel_value.unsqueeze(0)
-        # pixel_values.append(pixel_value)
+        img = image
+        img = np.array(img).astype(np.uint8)
+        img = Image.fromarray(img)
+        img = img.resize((512, 512), resample=Image.BILINEAR)
+        img= np.array(img).astype(np.uint8)
+        img = (img / 127.5 - 1.0).astype(np.float32)
+        pixel_value = torch.from_numpy(img).permute(2, 0, 1)
+        pixel_value = pixel_value.unsqueeze(0)
+        pixel_values.append(pixel_value)
         image_name +=(path.split('/')[-2].split('.')[0]+'_')
         img = trans(image)
-        if i == 1:
+        if i == 0:
             referenceImage0.append(img)
-        referenceImage1.append(img)
+        if i == 1:
+            referenceImage1.append(img)
     assert len(referenceImage0) == len(token_indices[0]), "The number of reference images should be the same as the number of token_indices"
     assert len(referenceImage1) == len(token_indices[1]), "The number of reference images should be the same as the number of token_indices"
     referenceImage.append(referenceImage0)
@@ -254,8 +256,8 @@ def main(config: RunConfig):
     controller = TextualControl(AttentionStore())
     for prompt in prompts:
         for i in range(len(prompt)):
-            os.makedirs(f"./images/{textual_name}/{prompt[i]}",exist_ok=True)
-        for seed in range(10,20):
+            os.makedirs(f"./images/result/{prompt[i]}",exist_ok=True)
+        for seed in range(20,30):
             g = torch.Generator('cuda').manual_seed(seed)
             images = run_on_prompt(prompt=prompt,
                                 model=pipe,
@@ -268,7 +270,7 @@ def main(config: RunConfig):
                                 referenceText = referenceText,
                                 pixel_values=pixel_values)
             for i,image in enumerate(images):
-                image.save(f"./images/{textual_name}/{prompt[i]}/{image_name}_{seed}.png")
+                image.save(f"./images/result/{prompt[i]}/{image_name}_{seed}.png")
 
 if __name__ == '__main__':
     main()

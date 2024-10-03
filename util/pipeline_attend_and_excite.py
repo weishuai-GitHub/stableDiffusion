@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from torchvision.transforms.functional import to_pil_image
+
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer,CLIPVisionModelWithProjection
 
 from diffusers.models import AutoencoderKL, UNet2DConditionModel,ImageProjection
@@ -132,6 +134,8 @@ def get_prompt_embeds(model:StableDiffusionPipeline,prompt,referenceProps,
         )[0]
  
 logger = logging.get_logger(__name__)
+
+
 
 class AttendAndExcitePipeline(StableDiffusionPipeline):
     r"""
@@ -1496,6 +1500,11 @@ class TextaulStableDiffusionXLPipeline(StableDiffusionXLPipeline):
         return StableDiffusionXLPipelineOutput(images=image)
 
 class TextaulandContrPipeline(StableDiffusionPipeline):
+    def get_latent(self,image,t,noises):
+        image = image.to(self.device,dtype=noises.dtype)
+        latent = self.vae.encode(image).latent_dist.mean*self.vae.config.scaling_factor
+        noises_latent = self.scheduler.add_noise(latent, noises, t)
+        return noises_latent
     @torch.no_grad()
     def __call__(
             self,
@@ -1602,17 +1611,20 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
         timesteps = self.scheduler.timesteps
 
         # 5. Prepare latent variables
-        num_channels_latents = self.unet.config.in_channels
-        latents = self.prepare_latents(
-            batch_size * num_images_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
-        )
+        noise = torch.randn((1, 4,64,64)).to(self.device,dtype=self.vae.dtype)
+        latent = self.get_latent(pixel_values[0],torch.tensor([999],dtype=torch.int64,device=self.device),noise)
+        latents = torch.cat([latent,latent],dim=0)
+        # num_channels_latents = self.unet.config.in_channels
+        # latents = self.prepare_latents(
+        #     batch_size * num_images_per_prompt,
+        #     num_channels_latents,
+        #     height,
+        #     width,
+        #     prompt_embeds.dtype,
+        #     device,
+        #     generator,
+        #     latents,
+        # )
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -1630,6 +1642,10 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
                 # predict the noise residual
+                if i in range(0,22):
+                    controller.turn_on()
+                else: 
+                    controller.turn_off()
                 noise_pred = self.unet(
                     latent_model_input,
                     t,
@@ -1644,15 +1660,23 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
-                if i<10:
+                if i==-5:
                     mask = get_cluter(controller.attentionStore,num_segments=5)
-                    token_map = cluster2noun(controller.attentionStore,mask,[i for i in range(len(prompt.split(' ')))],num_segments=5)
-                    background_mask = get_background_mask(mask,token_map,num_segments=5)
-                    mask = np.zeros_like(background_mask)
-                    mask[background_mask==0] =1
-                    mask = torch.from_numpy(mask).to(device=self._execution_device,dtype=latents.dtype)
+                    # token_map = cluster2noun(controller.attentionStore,mask,[i for i in range(len(prompt[0].split(' ')))],num_segments=5)
+                    # background_mask = get_background_mask(mask,token_map,num_segments=5)
+                    min_v = mask.min()
+                    max_v = mask.max()
+                    mask_ = (mask - min_v) / (max_v - min_v)
+                    
+                    mask = torch.from_numpy(mask_).to(device=self._execution_device,dtype=latents.dtype)
                     mask = torch.nn.functional.interpolate(mask.unsqueeze(0).unsqueeze(0), size=(64, 64), mode="nearest")
                     mask = mask.reshape(64,64)
+                    mask_image = to_pil_image(mask * 255)
+                    mask_image.save(f"mask/{prompt[0]}_mask_{i}.png")
+                    mask_ = 255*mask_
+                    mask_ = mask_.astype(np.uint8)
+                    mask_ = Image.fromarray(mask_)
+                    mask_.save(f'mask/background_mask_{i}.png')
                     latents[1] = mask*latents[0]+(1-mask)*latents[1]
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
