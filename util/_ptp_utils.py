@@ -1,20 +1,15 @@
 import abc
 
-import matplotlib.pyplot as plt
 import cv2
 import numpy as np
 import torch
 from IPython.display import display
 from PIL import Image
-from typing import Any, Callable, Union, Tuple, List
+from typing import Any, Callable, Dict, Union, Tuple, List
 from diffusers.models.attention import Attention
-from transformers import CLIPTextModel,CLIPTextModelWithProjection
+from transformers import CLIPTextModel
 from transformers.modeling_outputs import BaseModelOutputWithPooling
-from transformers.models.clip.modeling_clip import ( _make_causal_mask,
-                                                    _expand_mask,
-                                                    CLIPTextModelOutput,
-                                                    CLIPTextTransformer)
-from transformers.models.clip.configuration_clip import CLIPTextConfig
+from transformers.models.clip.modeling_clip import _make_causal_mask,_expand_mask
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
 from typing import Optional, Tuple, Union
@@ -24,7 +19,12 @@ from packaging import version
 import random
 from einops import rearrange, repeat
 from util.transforms import get_strong_aug
+from diffusers.utils.constants import *
 from diffusers.utils.import_utils import is_xformers_available
+from diffusers.models.attention import BasicTransformerBlock,_chunked_feed_forward
+from diffusers.models.resnet import ResnetBlock2D
+from diffusers.models.upsampling import Upsample2D
+from diffusers.models.downsampling import Downsample2D
 from torch import nn
 from torch.nn import functional as F
 # from torch import nn 
@@ -144,6 +144,7 @@ def view_images(images: Union[np.ndarray, List],
     if display_image:
         display(pil_img)
     return pil_img
+
 
 class AttendExciteCrossAttnProcessor:
 
@@ -310,184 +311,6 @@ class StoreLossControl:
         if self.cur_step == self.total_step:
             self.loss /= self.total_step
 
-class TextualCrossAttnProcessor:
-    MODEL_TYPE = {
-        "SD": 16,
-        "SDXL": 70
-    }
-    def __init__(self,place_in_unet,controller,cross_layer:int=0,self_layer:int=0,last_layer:int=16,
-                alph:float = 0.5,model_type= 'SD',attention_op: Optional[Callable] = None) -> None:
-        self.place_in_unet = place_in_unet
-        self.controller = controller
-        self.cross_layer = cross_layer
-        self.self_layer = self_layer
-        self.attention_op = attention_op
-        self.model_type = model_type
-        self.total_layers = self.MODEL_TYPE.get(model_type, 16)
-        self.last_layer = min(last_layer,self.total_layers)
-        self.alph = alph
-        self.is_query = True
-        self.v_concatenated = None
-        self.v_concatenated_neg = None
-        self.k_concatenated = None
-        self.k_concatenated_neg = None
-        self.attentionStore = controller.attentionStore
-    
-    def reset(self):
-        self.is_query = True
-        self.query = None
-        self.key = None
-        self.value = None
-    def __call__(self, attn: Attention, hidden_states, 
-                encoder_hidden_states=None, attention_mask=None,temb=None):
-        #if hidden_states.shape == (6, 4096, 320):
-        #    tensor_zeros = torch.zeros((6, 4096, 320)).to('cuda')
-        #    hidden_states = torch.cat((hidden_states, tensor_zeros), dim=1)
-        #from util.pipeline_attend_and_excite import mask_cat_invet
-        residual = hidden_states
-
-        if attn.spatial_norm is not None:
-            hidden_states = attn.spatial_norm(hidden_states, temb)
-
-        input_ndim = hidden_states.ndim
-
-        if input_ndim == 4:
-            batch_size, channel, height, width = hidden_states.shape
-            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
-        batch_size, sequence_length, _ = (
-            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
-        )
-        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size=1)
-        if attn.group_norm is not None:
-            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
-        is_cross = encoder_hidden_states is not None
-        
-        if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
-        elif attn.norm_cross:
-            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
-        
-        query,key,value,v_concatenated,v_concatenated_neg,k_concatenated,k_concatenated_neg = self.controller.forward(self,attn, is_cross,hidden_states,encoder_hidden_states)
-        q_concatenated = query[2]       
-        q_concatenated_neg = query[5]
-        query = attn.head_to_batch_dim(query)
-        key = attn.head_to_batch_dim(key)
-        value = attn.head_to_batch_dim(value)        
-        mask1 = self.controller.mask1
-        mask2 = self.controller.mask2
-        timestep = self.controller.timestep
-
-        #am_shape = attention_mask.shape
-        attention_probs = attn.get_attention_scores(query, key, )
-        if self.attentionStore is not None:
-            self.attentionStore(attention_probs, is_cross, self.place_in_unet)
-
-        v_concatenated = v_concatenated.unsqueeze(0)
-        v_concatenated_neg = v_concatenated_neg.unsqueeze(0)        
-        k_concatenated = k_concatenated.unsqueeze(0)       
-        k_concatenated_neg = k_concatenated_neg.unsqueeze(0)
-        q_concatenated = q_concatenated.unsqueeze(0)       
-        q_concatenated_neg = q_concatenated_neg.unsqueeze(0)
-        
-        v_concatenated = attn.head_to_batch_dim(v_concatenated)
-        v_concatenated_neg = attn.head_to_batch_dim(v_concatenated_neg)
-        k_concatenated = attn.head_to_batch_dim(k_concatenated)
-        k_concatenated_neg = attn.head_to_batch_dim(k_concatenated_neg)
-        q_concatenated = attn.head_to_batch_dim(q_concatenated)
-        q_concatenated_neg = attn.head_to_batch_dim(q_concatenated_neg)
-        
-        # hidden_states = F.scaled_dot_product_attention(
-        #     query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        # )
-        hidden_states = xformers.ops.memory_efficient_attention(
-            query, key, value, attn_bias=attention_mask, op=self.attention_op, scale=attn.scale
-        )
-        
-        #替换第3个
-        if mask1 is not None and not is_cross and self.place_in_unet == 'up' and self.self_layer >= self.last_layer: # self.self_layer = 8
-            dim_size = query.size(1)
-            sqrt_dim_size = torch.sqrt(torch.tensor(dim_size, dtype=torch.float32))
-            sqrt_dim_size = sqrt_dim_size.item()
-            sqrt_dim_size = int(sqrt_dim_size)
-            # print(f"mask1.shape = {mask1.shape}, mask2.shape = {mask2.shape}")
-            w,h = mask1.shape
-            mask1_ = mask1.reshape(1,1,w, h)
-            mask2_ = mask2.reshape(1,1,w, h)
-            # print(mask1_.shape)   
-            # mask1_ = mask1_.unsqueeze(0)
-            # mask2_ = mask2_.unsqueeze(0)    
-            downsampled_tensor1 = F.interpolate(mask1_, size=(sqrt_dim_size, sqrt_dim_size), mode='nearest')
-            downsampled_tensor2 = F.interpolate(mask2_, size=(sqrt_dim_size, sqrt_dim_size), mode='nearest')
-            mask1_ = downsampled_tensor1.squeeze(0) 
-            mask2_ = downsampled_tensor2.squeeze(0)
-            mask1_[mask1_ == 0] = float('-inf')
-            mask1_[mask1_ == 1] = float(0)
-            mask2_[mask2_ == 0] = float('-inf')
-            mask2_[mask2_ == 1] = float(0)
-            # plt.imshow(mask2_.cpu(), cmap='gray')
-            # plt.axis('off')
-            # plt.savefig(f"down_mask1_{k}.jpg")
-            # plt.show()
-            mask1_d = downsampled_tensor1.reshape(1, 1 ,sqrt_dim_size * sqrt_dim_size)
-            mask2_d = downsampled_tensor2.reshape(1, 1 ,sqrt_dim_size * sqrt_dim_size)
-            # mask1_d = mask1_d.repeat(batch_size, 1, 1, 1)
-            # mask2_d = mask2_d.repeat(batch_size, 1, 1, 1)
-
-            zero_mask = torch.zeros_like(mask1_d)            
-            mask = torch.cat((mask1_d, mask2_d, zero_mask), dim=2)
-            if self.model_type=="SDXL":
-                matrix1 = torch.ones_like(mask1_) * 0.8
-                matrix2 = torch.ones_like(mask1_) * 1.2
-                matrix3 = torch.ones_like(mask1_) * 1.0
-            else:
-                matrix1 = torch.ones_like(mask1_) * 0.8
-                matrix2 = torch.ones_like(mask1_) * 1.2
-                matrix3 = torch.ones_like(mask1_) * 1
-            matrix1 = matrix1.reshape(1,1, sqrt_dim_size * sqrt_dim_size)
-            matrix2 = matrix2.reshape(1,1, sqrt_dim_size * sqrt_dim_size)
-            matrix3 = matrix3.reshape(1,1, sqrt_dim_size * sqrt_dim_size)
-            matrix = torch.cat((matrix1, matrix2, matrix3), dim=2)
-            attention_probs = attn.get_attention_scores(q_concatenated, k_concatenated, attention_mask, mask, matrix)
-            hidden_states_concatenated = torch.bmm(attention_probs, v_concatenated)
-            attention_probs = attn.get_attention_scores(q_concatenated_neg, k_concatenated_neg, attention_mask, mask, matrix)
-            hidden_states_concatenated_neg = torch.bmm(attention_probs, v_concatenated_neg)
-            hidden_states = hidden_states.to(query.dtype)
-            hidden_states = attn.batch_to_head_dim(hidden_states)
-
-            hidden_states_concatenated = hidden_states_concatenated.to(query.dtype)
-            hidden_states_concatenated = attn.batch_to_head_dim(hidden_states_concatenated)
-            hidden_states_concatenated_neg = hidden_states_concatenated_neg.to(query.dtype)
-            hidden_states_concatenated_neg = attn.batch_to_head_dim(hidden_states_concatenated_neg)
-
-            hidden_states[2] = hidden_states_concatenated[0]
-            hidden_states[5] = hidden_states_concatenated_neg[0]
-        else:
-            hidden_states = hidden_states.to(query.dtype)
-            hidden_states = attn.batch_to_head_dim(hidden_states)
-        #     hidden_states_concatenated = xformers.ops.memory_efficient_attention(
-        #     q_concatenated, k_concatenated, v_concatenated, attn_bias=attention_mask, op=self.attention_op, scale=attn.scale
-        #     )
-        #     hidden_states_concatenated_neg = xformers.ops.memory_efficient_attention(
-        #     q_concatenated_neg, k_concatenated_neg, v_concatenated_neg, attn_bias=attention_mask, op=self.attention_op, scale=attn.scale
-        #     )
-
-       
-        
-        # linear proj
-        hidden_states = attn.to_out[0](hidden_states)
-        # dropout
-        hidden_states = attn.to_out[1](hidden_states)
-        
-        if input_ndim == 4:
-            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
-
-        if attn.residual_connection:
-            hidden_states = hidden_states + residual
-
-        hidden_states = hidden_states / attn.rescale_output_factor
-
-        return hidden_states
-
 class AttentionControl(abc.ABC):
 
     def step_callback(self, x_t):
@@ -521,6 +344,11 @@ class AttentionControl(abc.ABC):
         self.cur_step = 0
         self.num_att_layers = -1
         self.cur_att_layer = 0
+
+class EmptyControl(AttentionControl):
+
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
+        return attn
 
 class AttentionStore(AttentionControl):
 
@@ -576,83 +404,292 @@ class AttentionStore(AttentionControl):
         self.curr_step_index = 0
         self.num_uncond_att_layers = 0
 
+def aggregate_attention(attention_store: AttentionStore,
+                        res: int,
+                        from_where: List[str],
+                        is_cross: bool,
+                        select: int) -> torch.Tensor:
+    """ Aggregates the attention across the different layers and heads at the specified resolution. """
+    out = []
+    attention_maps = attention_store.get_average_attention()
+
+    num_pixels = res ** 2
+    for location in from_where:
+        for item in attention_maps[f"{location}_{'cross' if is_cross else 'self'}"]:
+            if item.shape[1] == num_pixels:
+                cross_maps = item.reshape(1, -1, res, res, item.shape[-1])[select]
+                out.append(cross_maps)
+    out = torch.cat(out, dim=0)
+    out = out.sum(0) / out.shape[0]
+    return out
+
+def register_attention_control(model, controller:AttentionStore):
+
+    attn_procs = {}
+    cross_att_count = 0
+    # attn_processors_key = []
+    # for name ,key in model.unet.named_parameters():
+    #     if 'attentions' in name:
+    #         attn_processors_key.append(name)
+    for name in model.unet.attn_processors.keys():
+        cross_attention_dim = None if name.endswith("attn1.processor") else model.unet.config.cross_attention_dim
+        if name.startswith("mid_block"):
+            hidden_size = model.unet.config.block_out_channels[-1]
+            place_in_unet = "mid"
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks.")])
+            hidden_size = list(reversed(model.unet.config.block_out_channels))[block_id]
+            place_in_unet = "up"
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks.")])
+            hidden_size = model.unet.config.block_out_channels[block_id]
+            place_in_unet = "down"
+        else:
+            continue
+
+        cross_att_count += 1
+        attn_procs[name] = AttendExciteCrossAttnProcessor(
+            attnstore=controller, place_in_unet=place_in_unet
+        )
+    model.unet.set_attn_processor(attn_procs)
+    controller.num_att_layers = cross_att_count
+
+
+# imgae edit control
 class TextualControl:
     def __init__(self,
-                 attentionStore:AttentionStore = None,
-                 alph:float = 0.5):
-        super().__init__()
-        self.cross_att_layer = 0
-        self.self_att_layer = 0
+        attentionStore:AttentionStore = None,
+        alph:float = 1.0,
+        ) -> None:
         self.is_edit=True
         self.attentionStore = attentionStore
-        self.name=None        
         self.alph = alph
-        self.timestep = 0
-        self.mask = None
-        self.mask1 = None
-        self.mask2 = None
-        
-        
+
     def turn_off(self):
         self.is_edit=False
+
     def turn_on(self):
         self.is_edit=True
-    def forward(self,processor:TextualCrossAttnProcessor,attn: Attention, is_cross:bool,hidden_states,encoder_hidden_states):
-        #print(hidden_states.shape)
-        if self.is_edit:
-            # if  is_cross and processor.self_layer<processor.last_layer and not processor.is_query :
-            #     query = processor.query
-            #     # key = processor.key
-            #     # value = processor.value
-            #     processor.reset()
-            # elif is_cross and processor.self_layer<processor.last_layer and processor.is_query:
-            #     query = attn.to_q(hidden_states)
-            #     processor.query = query
-            #     # key = attn.to_k(encoder_hidden_states)
-            #     # processor.key = key
-            #     # value = attn.to_v(encoder_hidden_states)
-            #     # processor.value = value
-            #     processor.is_query = False
-            # else:
-            #     query = attn.to_q(hidden_states)
 
-            query = attn.to_q(hidden_states)
-            key = attn.to_k(encoder_hidden_states)
-            value = attn.to_v(encoder_hidden_states)
+    def __call__(self, 
+        query:torch.Tensor,
+        key:torch.Tensor,
+        value:torch.Tensor,
+        is_cross:bool,
+        ) ->Tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
+        if self.is_edit and not is_cross:
             
-            # v_concatenated = torch.cat((value[0,:4096,:], value[1,:4096,:]), dim=0) 
-            # v_concatenated_neg = torch.cat((value[3,:4096,:], value[4,:4096,:]), dim=0)
+            value[1,:] = self.alph*value[0,:] + (1- self.alph)*value[1,:]
+            key[1,:] = self.alph*key[0,:] + (1- self.alph)*key[1,:]
             
-            # k_concatenated = torch.cat((key[0,:4096,:], key[1,:4096,:]), dim=0) 
-            # k_concatenated_neg = torch.cat((key[3,:4096,:], key[4,:4096,:]), dim=0)
-            v_concatenated = torch.cat((value[0,:,:], value[1,:,:],value[2,:,:]), dim=0) 
-            v_concatenated_neg = torch.cat((value[3,:,:], value[4,:,:],value[5,:,:]), dim=0)
-            
-            k_concatenated = torch.cat((key[0,:,:], key[1,:,:], key[2,:,:]), dim=0) 
-            k_concatenated_neg = torch.cat((key[3,:,:], key[4,:,:], key[5,:,:]), dim=0)
-            
-            #value[2,:] = value[0,:] + (1- self.alph)*value[1,:]
-            #key[2,:] = self.alph*key[0,:] + (1- self.alph)*key[1,:]            
-            #value[5,:] = self.alph*value[3,:] + (1- self.alph)*value[4,:]
-            #key[5,:] = self.alph*key[3,:] + (1- self.alph)*key[4,:]
-        else:
-            query = attn.to_q(hidden_states)
-            key = attn.to_k(encoder_hidden_states)
-            value = attn.to_v(encoder_hidden_states)
-            
-            v_concatenated = value[2,:4096,:]
-            v_concatenated_neg = value[5,:4096,:]
-            
-            k_concatenated = key[2,:4096,:]
-            k_concatenated_neg = key[5,:4096,:]
-        return query,key,value,v_concatenated,v_concatenated_neg,k_concatenated,k_concatenated_neg
+            value[3,:] = self.alph*value[2,:] + (1- self.alph)*value[3,:]
+            key[3,:] = self.alph*key[2,:] + (1- self.alph)*key[3,:]
+            # print(query.shape,key.shape,value.shape)
+        return query,key,value
+
+class TextualAttnProcessor:
+    MODEL_TYPE = {
+        "SD": 16,
+        "SDXL": 70
+    }
+    def __init__(self,place_in_unet,controller:TextualControl,cross_layer:int=0,self_layer:int=0,last_layer:int=16,
+                alph:float = 0.5,model_type= 'SD',is_injection=True,attention_op: Optional[Callable] = None,) -> None:
+        self.place_in_unet = place_in_unet
+        self.controller = controller
+        self.attentionStore = controller.attentionStore
+        self.cross_layer = cross_layer
+        self.self_layer = self_layer
+        self.attention_op = attention_op
+        self.is_injection = is_injection
+        self.total_layers = self.MODEL_TYPE.get(model_type, 16)
+        self.last_layer = min(last_layer,self.total_layers)
+        
     
+    def __call__(self, 
+                attn: Attention,
+                hidden_states: torch.FloatTensor,
+                encoder_hidden_states: Optional[torch.FloatTensor] = None,
+                attention_mask: Optional[torch.FloatTensor] = None,
+                temb: Optional[torch.FloatTensor] = None,
+        ) -> torch.Tensor:
+        
+        residual = hidden_states
 
-def register_textual_attention_control(model,controller=None,last_layer:int=16,model_type= 'SD'):
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+        
+        is_cross = encoder_hidden_states is not None
+        query = attn.to_q(hidden_states)
+        
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+        
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        assert query.shape[0] == 4, f"query shape is {query.shape}, but should be [4,_]"
+
+        # self-attention control
+        if self.self_layer < self.last_layer or self.cross_layer < self.last_layer and self.is_injection: 
+            query,key,value = self.controller(query,key,value,is_cross)
+        
+        
+        query = attn.head_to_batch_dim(query)
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        
+        # get attention_probs to store
+        q_shape = query.shape
+        k_shape = key.shape
+        # am_shape = attention_mask.shape
+        attention_probs = attn.get_attention_scores(query[:q_shape[0] //4,:,:], 
+                                                    key[:k_shape[0]  //4,:,:], 
+                                                    )
+        self.attentionStore(attention_probs, is_cross, self.place_in_unet)
+        #
+        hidden_states = xformers.ops.memory_efficient_attention(
+            query, key, value, attn_bias=attention_mask, op=self.attention_op, scale=attn.scale
+        )
+        hidden_states = hidden_states.to(query.dtype)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+
+        # linear proj
+        hidden_states = attn.to_out[0](hidden_states)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+
+        return hidden_states
+
+def co_forward(self:ResnetBlock2D,controller:TextualControl):
+    def forward(
+        input_tensor: torch.FloatTensor,
+        temb: torch.FloatTensor,
+        scale: float = 1.0,
+    ) -> torch.FloatTensor:
+        hidden_states = input_tensor
+
+        if self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
+            hidden_states = self.norm1(hidden_states, temb)
+        else:
+            hidden_states = self.norm1(hidden_states)
+
+        hidden_states = self.nonlinearity(hidden_states)
+
+        if self.upsample is not None:
+            # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
+            if hidden_states.shape[0] >= 64:
+                input_tensor = input_tensor.contiguous()
+                hidden_states = hidden_states.contiguous()
+            input_tensor = (
+                self.upsample(input_tensor, scale=scale)
+                if isinstance(self.upsample, Upsample2D)
+                else self.upsample(input_tensor)
+            )
+            hidden_states = (
+                self.upsample(hidden_states, scale=scale)
+                if isinstance(self.upsample, Upsample2D)
+                else self.upsample(hidden_states)
+            )
+        elif self.downsample is not None:
+            input_tensor = (
+                self.downsample(input_tensor, scale=scale)
+                if isinstance(self.downsample, Downsample2D)
+                else self.downsample(input_tensor)
+            )
+            hidden_states = (
+                self.downsample(hidden_states, scale=scale)
+                if isinstance(self.downsample, Downsample2D)
+                else self.downsample(hidden_states)
+            )
+
+        hidden_states = self.conv1(hidden_states, scale) if not USE_PEFT_BACKEND else self.conv1(hidden_states)
+
+        if self.time_emb_proj is not None:
+            if not self.skip_time_act:
+                temb = self.nonlinearity(temb)
+            temb = (
+                self.time_emb_proj(temb, scale)[:, :, None, None]
+                if not USE_PEFT_BACKEND
+                else self.time_emb_proj(temb)[:, :, None, None]
+            )
+
+        if temb is not None and self.time_embedding_norm == "default":
+            hidden_states = hidden_states + temb
+
+        if self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
+            hidden_states = self.norm2(hidden_states, temb)
+        else:
+            hidden_states = self.norm2(hidden_states)
+
+        if temb is not None and self.time_embedding_norm == "scale_shift":
+            scale, shift = torch.chunk(temb, 2, dim=1)
+            hidden_states = hidden_states * (1 + scale) + shift
+
+        hidden_states = self.nonlinearity(hidden_states)
+
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.conv2(hidden_states, scale) if not USE_PEFT_BACKEND else self.conv2(hidden_states)
+        # print(f"controller isedit = {controller.is_edit}")
+        if controller.is_edit:
+            hidden_states[1] = hidden_states[0]
+            hidden_states[3] = hidden_states[2]
+
+        if self.conv_shortcut is not None:
+            input_tensor = (
+                self.conv_shortcut(input_tensor, scale) if not USE_PEFT_BACKEND else self.conv_shortcut(input_tensor)
+            )
+        output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
+        
+
+        return output_tensor
+    return forward
+
+
+def register_textual_attention_control(model,controller:TextualControl=None,last_layer:int=16,model_type= 'SD'):
+    
+    # injection Residual Block
+    layers = []
+    # for downsample_block in model.unet.down_blocks:
+    #     if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
+    #         for resnet in downsample_block.resnets:
+    #             layers.append(resnet)
+    # if hasattr(model.unet.mid_block, "has_cross_attention") and model.unet.mid_block.has_cross_attention:        
+    #     for resnet in model.unet.mid_block.resnets[1:]:
+    #         layers.append(resnet)
+    for upsample_block in model.unet.up_blocks:
+        if hasattr(upsample_block, "has_cross_attention") and upsample_block.has_cross_attention:
+            for resnet in upsample_block.resnets: 
+                layers.append(resnet)
+
+    # layers.append(model.unet.up_blocks[1].resnets[1])
+
     cross_layer = 0
     self_layer = 0
     Processor = {}
-    cross_att_count = 0
+    cross_att_count  = 0
     for name in model.unet.attn_processors.keys():
         cross_attention_dim = None if name.endswith("attn1.processor") else model.unet.config.cross_attention_dim
         if name.startswith("mid_block"):
@@ -669,25 +706,27 @@ def register_textual_attention_control(model,controller=None,last_layer:int=16,m
         else:
             continue
         cross_att_count += 1
-        # is_injection = False
+        is_injection = False
         if cross_attention_dim==None:
-            # if self_layer>=7:
-            #     is_injection = True
-            Processor[name] = TextualCrossAttnProcessor(
+            if self_layer>=7:
+                is_injection = True
+            Processor[name] = TextualAttnProcessor(
             place_in_unet=place_in_unet,controller=controller,self_layer=self_layer,
-            last_layer=last_layer,model_type=model_type)
-            self_layer+=1 #！和新版不一样 不知道需不需要改 我觉得不用 因为没有注入了 只有q k v的替换
+            last_layer=last_layer,is_injection=is_injection, model_type=model_type)
+            self_layer+=1
         else:
-            Processor[name] = TextualCrossAttnProcessor(
+            Processor[name] = TextualAttnProcessor(
                 place_in_unet=place_in_unet,controller=controller,cross_layer=cross_layer,
                 last_layer=last_layer,model_type=model_type)
             cross_layer+=1
     model.unet.set_attn_processor(Processor)
-    if controller.attentionStore is not None:
-        controller.attentionStore.num_att_layers = cross_att_count
 
-class TextualCLIPTextTransformer(CLIPTextTransformer):
-    
+    controller.attentionStore.num_att_layers = cross_att_count
+    for i in range(4,8):
+        setattr(layers[i], "forward", co_forward(layers[i],controller))
+
+
+class TextualCLIPTextModel(CLIPTextModel):
     def forward(
         self,
         placeholder_token_embed: torch.Tensor,
@@ -716,10 +755,13 @@ class TextualCLIPTextTransformer(CLIPTextTransformer):
         >>> last_hidden_state = outputs.last_hidden_state
         >>> pooled_output = outputs.pooler_output  # pooled (EOS token) states
         ```"""
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        output_attentions = output_attentions if output_attentions is not None else self.text_model.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.text_model.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.text_model.config.use_return_dict
 
         if input_ids is None:
             raise ValueError("You have to specify input_ids")
@@ -733,7 +775,7 @@ class TextualCLIPTextTransformer(CLIPTextTransformer):
         # input_ids = torch.cat([input_ids]*2,dim=0)
         (Num,seq_length)= input_ids.shape
         input_shape = input_ids.size()
-        embeddings = self.embeddings
+        embeddings = self.text_model.embeddings
         if position_ids is None:
             position_ids = embeddings.position_ids[:, :seq_length]
         
@@ -756,7 +798,7 @@ class TextualCLIPTextTransformer(CLIPTextTransformer):
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             attention_mask = _expand_mask(attention_mask, hidden_states.dtype)
 
-        encoder_outputs = self.encoder(
+        encoder_outputs = self.text_model.encoder(
             inputs_embeds=hidden_states,
             attention_mask=attention_mask,
             causal_attention_mask=causal_attention_mask,
@@ -766,9 +808,9 @@ class TextualCLIPTextTransformer(CLIPTextTransformer):
         )
 
         last_hidden_state = encoder_outputs[0]
-        last_hidden_state = self.final_layer_norm(last_hidden_state)
+        last_hidden_state = self.text_model.final_layer_norm(last_hidden_state)
 
-        if self.eos_token_id == 2:
+        if self.text_model.eos_token_id == 2:
             # The `eos_token_id` was incorrect before PR #24773: Let's keep what have been done here.
             # A CLIP model with such `eos_token_id` in the config can't work correctly with extra new tokens added
             # ------------------------------------------------------------
@@ -784,7 +826,7 @@ class TextualCLIPTextTransformer(CLIPTextTransformer):
             pooled_output = last_hidden_state[
                 torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
                 # We need to get the first position of `eos_token_id` value (`pad_token_ids` might equal to `eos_token_id`)
-                (input_ids.to(dtype=torch.int, device=last_hidden_state.device) == self.eos_token_id)
+                (input_ids.to(dtype=torch.int, device=last_hidden_state.device) == self.text_model.eos_token_id)
                 .int()
                 .argmax(dim=-1),
             ]
@@ -798,120 +840,6 @@ class TextualCLIPTextTransformer(CLIPTextTransformer):
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
-
-class TextualCLIPTextModel(CLIPTextModel):
-
-    def __init__(self, config: CLIPTextConfig):
-        super().__init__(config)
-        self.text_model = TextualCLIPTextTransformer(config)
-        self.post_init()
-
-    def forward(
-        self,
-        placeholder_token_embed: torch.Tensor,
-        placeholder_token_index: torch.Tensor,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPooling]:
-        r"""
-        Returns:
-
-        Examples:
-
-        ```python
-        >>> from transformers import AutoTokenizer, TextualCLIPTextModel
-
-        >>> model = TextualCLIPTextModel.from_pretrained("openai/clip-vit-base-patch32")
-        >>> tokenizer = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32")
-
-        >>> inputs = tokenizer(["a photo of a cat", "a photo of a dog"], padding=True, return_tensors="pt")
-
-        >>> outputs = model(**inputs)
-        >>> last_hidden_state = outputs.last_hidden_state
-        >>> pooled_output = outputs.pooler_output  # pooled (EOS token) states
-        ```"""
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        return self.text_model(
-            placeholder_token_embed=placeholder_token_embed,
-            placeholder_token_index=placeholder_token_index,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-class TextualCLIPTextModelWithProjection(CLIPTextModelWithProjection):
-
-    def __init__(self, config: CLIPTextConfig):
-        super().__init__(config)
-        self.text_model = TextualCLIPTextTransformer(config)
-        self.text_projection = nn.Linear(config.hidden_size, config.projection_dim, bias=False)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-    
-    def forward(
-        self,
-        placeholder_token_embed: torch.Tensor,
-        placeholder_token_index: torch.Tensor,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, CLIPTextModelOutput]:
-        r"""
-        Returns:
-
-        Examples:
-
-        ```python
-        >>> from transformers import AutoTokenizer, TextualCLIPTextModelWithProjection
-
-        >>> model = TextualCLIPTextModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
-        >>> tokenizer = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32")
-
-        >>> inputs = tokenizer(["a photo of a cat", "a photo of a dog"], padding=True, return_tensors="pt")
-
-        >>> outputs = model(**inputs)
-        >>> last_hidden_state = outputs.last_hidden_state
-        >>> pooled_output = outputs.pooler_output  # pooled (EOS token) states
-        ```"""
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        text_outputs = self.text_model(
-            placeholder_token_embed=placeholder_token_embed,
-            placeholder_token_index=placeholder_token_index,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-        pooled_output = text_outputs[1]
-
-        text_embeds = self.text_projection(pooled_output)
-
-        if not return_dict:
-            outputs = (text_embeds, text_outputs[0]) + text_outputs[2:]
-            return tuple(output for output in outputs if output is not None)
-
-        return CLIPTextModelOutput(
-            text_embeds=text_embeds,
-            last_hidden_state=text_outputs.last_hidden_state,
-            hidden_states=text_outputs.hidden_states,
-            attentions=text_outputs.attentions,
-        )
-
 
 class TextualInversionDataset(ImageFolder):
     def __init__(self,data_root,tokenizer,learnable_property="object",  # [object, style]
@@ -1068,6 +996,8 @@ class TextualInversionXLDataset(ImageFolder):
         # default to score-sde preprocessing
         img = np.array(image).astype(np.uint8)
         image = Image.fromarray(img)
+        image = image.resize((self.size, self.size), resample=self.interpolation)
+
         image = self.flip_transform(image)
         image= np.array(image).astype(np.uint8)
         image = (image / 127.5 - 1.0).astype(np.float32)
@@ -1089,84 +1019,17 @@ class TextualInversionXLDataset(ImageFolder):
             max_length=self.tokenizer_1.model_max_length,
             return_tensors="pt",
         ).input_ids[0]
-        placeholder_token_id_2  = self.tokenizer_2.encode(self.placeholder_token, add_special_tokens=False)[0]
+
         example["input_ids_2"] = self.tokenizer_2(
-            text, # "A clean picture where you can clearly see the objects in the image."
+            text,
             padding="max_length",
             truncation=True,
             max_length=self.tokenizer_2.model_max_length,
             return_tensors="pt",
         ).input_ids[0]
         example["index"] = torch.where(example["input_ids_1"] == placeholder_token_id)[0][0]
-        example["index_2"] = torch.where(example["input_ids_2"] == placeholder_token_id_2)[0][0]
         return example
 
-def register_attention_control(model, controller):
-
-    attn_procs = {}
-    cross_att_count = 0
-    # attn_processors_key = []
-    # for name ,key in model.unet.named_parameters():
-    #     if 'attentions' in name:
-    #         attn_processors_key.append(name)
-    for name in model.unet.attn_processors.keys():
-        cross_attention_dim = None if name.endswith("attn1.processor") else model.unet.config.cross_attention_dim
-        if name.startswith("mid_block"):
-            hidden_size = model.unet.config.block_out_channels[-1]
-            place_in_unet = "mid"
-        elif name.startswith("up_blocks"):
-            block_id = int(name[len("up_blocks.")])
-            hidden_size = list(reversed(model.unet.config.block_out_channels))[block_id]
-            place_in_unet = "up"
-        elif name.startswith("down_blocks"):
-            block_id = int(name[len("down_blocks.")])
-            hidden_size = model.unet.config.block_out_channels[block_id]
-            place_in_unet = "down"
-        else:
-            continue
-
-        cross_att_count += 1
-        attn_procs[name] = AttendExciteCrossAttnProcessor(
-            attnstore=controller, place_in_unet=place_in_unet
-        )
-    model.unet.set_attn_processor(attn_procs)
-    controller.num_att_layers = cross_att_count
-
-
-
-class EmptyControl(AttentionControl):
-
-    def forward(self, attn, is_cross: bool, place_in_unet: str):
-        return attn
-
-
-def aggregate_attention(attention_store: AttentionStore,
-                        res: int,
-                        from_where: List[str],
-                        is_cross: bool,
-                        select: int) -> torch.Tensor:
-    """ Aggregates the attention across the different layers and heads at the specified resolution. """
-    out = []
-    attention_maps = attention_store.get_average_attention()
-
-    num_pixels = res ** 2
-    for location in from_where:
-        for item in attention_maps[f"{location}_{'cross' if is_cross else 'self'}"]:
-            if item.shape[1] == num_pixels:
-                cross_maps = item.reshape(6, -1, res, res, item.shape[-1])
-                #cross_maps = item.reshape(1, -1, res, res, item.shape[-1])[select]
-                #cross_maps [6,10,32,32,1024]
-                out.append(cross_maps)
-    # 假设 out 列表中的张量数量是 6 的倍数
-    out = torch.cat(out, dim=0)  # 拼接所有张量    
-    batch_size = out.shape[0] * out.shape[1]
-    group_size = batch_size // 6
-    out = out.view(6, group_size, *out.shape[2:])  # 重新分割为6个子组，每组包含相同数量的张量
-    out = out.mean(dim=1)  # 对每组的张量在 dim=1 上取平均
-
-    # out = torch.cat(out, dim=0)
-    # out = out.sum(0) / out.shape[0]
-    return out
 
 class AttentionBase:
     def __init__(self):
@@ -1231,73 +1094,6 @@ class MasaAttentionStore(AttentionBase):
                 self.self_attns_step.append(attn)
         return super().forward(q, k, v, sim, attn, is_cross, place_in_unet, num_heads, **kwargs)
 
-
-def regiter_attention_editor_diffusers(model, editor: AttentionBase):
-    """
-    Register a attention editor to Diffuser Pipeline, refer from [Prompt-to-Prompt]
-    """
-    def ca_forward(self, place_in_unet):
-        def forward(x, encoder_hidden_states=None, attention_mask=None, context=None, mask=None):
-            """
-            The attention is similar to the original implementation of LDM CrossAttention class
-            except adding some modifications on the attention
-            """
-            if encoder_hidden_states is not None:
-                context = encoder_hidden_states
-            if attention_mask is not None:
-                mask = attention_mask
-
-            to_out = self.to_out
-            if isinstance(to_out, nn.modules.container.ModuleList):
-                to_out = self.to_out[0]
-            else:
-                to_out = self.to_out
-
-            h = self.heads
-            q = self.to_q(x)
-            is_cross = context is not None
-            context = context if is_cross else x
-            k = self.to_k(context)
-            v = self.to_v(context)
-            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
-
-            sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
-
-            if mask is not None:
-                mask = rearrange(mask, 'b ... -> b (...)')
-                max_neg_value = -torch.finfo(sim.dtype).max
-                mask = repeat(mask, 'b j -> (b h) () j', h=h)
-                mask = mask[:, None, :].repeat(h, 1, 1)
-                sim.masked_fill_(~mask, max_neg_value)
-
-            attn = sim.softmax(dim=-1)
-            # the only difference
-            out = editor(
-                q, k, v, sim, attn, is_cross, place_in_unet,
-                self.heads, scale=self.scale)
-
-            return to_out(out)
-
-        return forward
-
-    def register_editor(net, count, place_in_unet):
-        for name, subnet in net.named_children():
-            if net.__class__.__name__ == 'Attention':  # spatial Transformer layer
-                net.forward = ca_forward(net, place_in_unet)
-                return count + 1
-            elif hasattr(net, 'children'):
-                count = register_editor(subnet, count, place_in_unet)
-        return count
-
-    cross_att_count = 0
-    for net_name, net in model.unet.named_children():
-        if "down" in net_name:
-            cross_att_count += register_editor(net, 0, "down")
-        elif "mid" in net_name:
-            cross_att_count += register_editor(net, 0, "mid")
-        elif "up" in net_name:
-            cross_att_count += register_editor(net, 0, "up")
-    editor.num_att_layers = cross_att_count
 
 def regiter_attention_editor_diffusers(model, editor: AttentionBase):
     """

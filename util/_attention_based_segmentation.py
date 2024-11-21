@@ -9,46 +9,35 @@ def get_cluter(controller,num_segments=2,res=32):
                                              is_cross=False, select=0)
     # cross_attention = aggregate_attention(controller, res=res, from_where=("up", "down"),
     #                                           is_cross=True, select=0)
-    kmeans = []
-    clusters = []
+    
     self_attention = self_attention.cpu().numpy()
     # cross_attention = cross_attention.cpu().numpy()
     np.random.seed(1)
-    prom,resolution,_,last_shape = self_attention.shape
-    #resolution,_,last_shape = self_attention.shape
-    
-    #attn = self_attention.reshape(resolution ** 2, last_shape)
-    attn = self_attention.reshape(prom,resolution ** 2, last_shape)
-    for i in range(prom):  # Iterate through all attention maps
-        kmeans = KMeans(n_clusters=num_segments, n_init=10).fit(attn[i])
-        cluster_labels = kmeans.labels_  # Get labels for the current attention map
-        cluster_labels = cluster_labels.reshape(resolution, resolution)  # Reshape to (resolution, resolution)
-        clusters.append(cluster_labels)  # Append to the clusters list
+    resolution,_,last_shape = self_attention.shape
 
-    # kmeans = KMeans(n_clusters=num_segments, n_init=10).fit(attn)
-    # clusters = kmeans.labels_
-    # clusters = clusters.reshape(resolution, resolution)
+    attn = self_attention.reshape(resolution ** 2, last_shape)
+    kmeans = KMeans(n_clusters=num_segments, n_init=10).fit(attn)
+    clusters = kmeans.labels_
+    clusters = clusters.reshape(resolution, resolution)
     return clusters
 
-def cluster2noun(controller,clusters,nouns_indices:list,num_segments=2,res=16,index=0):
+def cluster2noun(controller,clusters,nouns_indices:list,num_segments=2,res=16):
     result = {}
     # nouns_indices = [index for (index, word) in self.nouns]
     # nouns_maps = self.cross_attention.cpu().numpy()[:, :, [i + 1 for i in nouns_indices]]
     cross_attention = aggregate_attention(controller, res=res, from_where=("up", "down"),
                                               is_cross=True, select=0)
-    nouns_maps = cross_attention[index].cpu().numpy()[:, :, [i + 1 for i in nouns_indices]]
+    nouns_maps = cross_attention.cpu().numpy()[:, :, [i + 1 for i in nouns_indices]]
     normalized_nouns_maps = np.zeros_like(nouns_maps).repeat(2, axis=0).repeat(2, axis=1)
-    #在最后一个维度上做平均
     for i in range(nouns_maps.shape[-1]):
         curr_noun_map = nouns_maps[:, :, i].repeat(2, axis=0).repeat(2, axis=1)
         normalized_nouns_maps[:, :, i] = (curr_noun_map - np.abs(curr_noun_map.min())) / curr_noun_map.max()
     for c in range(num_segments):
-        cluster_mask = np.zeros_like(clusters[index])
-        cluster_mask[clusters[index] == c] = 1
-        if clusters[index].sum() <1:continue
+        cluster_mask = np.zeros_like(clusters)
+        cluster_mask[clusters == c] = 1
+        if clusters.sum() <1:continue
         score_maps = [cluster_mask * normalized_nouns_maps[:, :, i] for i in range(len(nouns_indices))]
         scores = [score_map.sum() / cluster_mask.sum() for score_map in score_maps]
-        scores = [score + np.random.normal(0, 1e-5) for score in scores]  # 添加一个非常小的随机扰动
         result[c] = np.argmax(np.array(scores))
     return result
 

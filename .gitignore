@@ -5,6 +5,8 @@
 *.csv
 *.txt
 .vscode
+.conda
+*.zip
 tmp.py
 latent
 CompVis
@@ -28,3 +30,4 @@ draw.py
 com_emp.sh
 result.py
 mask
+_test.py

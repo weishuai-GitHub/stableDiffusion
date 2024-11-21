@@ -1,6 +1,6 @@
-export DATA_DIR="datasets/Mixed_dataset"
+export DATA_DIR="datasets/animals"
 ROOT="/opt/data/private/stable_diffusion_model"
-DIR="textual_inversion_find_xl_mixed_768_1"
+DIR="xl_mixed_768_4"
 export MODEL_NAME="stabilityai/stable-diffusion-xl-base-1.0"
 accelerate launch sdxl_main.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
@@ -12,16 +12,16 @@ accelerate launch sdxl_main.py \
   --resolution=768 \
   --train_batch_size=4 \
   --gradient_accumulation_steps=4 \
-  --max_train_steps=5500 \
+  --max_train_steps=10000 \
   --learning_rate=1.0e-04 --scale_lr \
   --enable_xformers_memory_efficient_attention \
   --lr_scheduler="constant" \
   --dataloader_num_workers=0 \
   --lr_warmup_steps=0 \
-  --out_dim=768 \
+  --out_dim=768 --out_dim_2=960 \
   --cls_dim=10 \
   --repeats 100 \
-  --unlabelled 11 \
+  --unlabelled 0 \
   --style_name "Ande Cubism Cute Fauvism Landscape_painting" \
   --output_dir=${ROOT}/${DIR}
 # export MODEL_NAME="stabilityai/stable-diffusion-xl-base-1.0"

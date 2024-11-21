@@ -7,6 +7,7 @@ from PIL import Image
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
 from torchvision.transforms.functional import to_pil_image
 
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer,CLIPVisionModelWithProjection
@@ -22,11 +23,11 @@ from diffusers.pipelines.stable_diffusion_xl.pipeline_output import StableDiffus
 from diffusers.image_processor import PipelineImageInput
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import rescale_noise_cfg,retrieve_timesteps
 from diffusers.loaders import LoraLoaderMixin, TextualInversionLoaderMixin
+
 from util.attention_based_segmentation import get_cluter,cluster2noun,get_background_mask
 from util.gaussian_smoothing import GaussianSmoothing
 from util.ptp_utils import AttentionStore, TextualControl, aggregate_attention,show_self_attention_comp
-from transformers.models.clip.modeling_clip import _make_causal_mask,_expand_mask,CLIPTextModelOutput
-from transformers import CLIPTextModelWithProjection
+from transformers.models.clip.modeling_clip import _make_causal_mask,_expand_mask
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 DICT_W={'stabilityai/stable-diffusion-2-1':31.2,
         'stabilityai/stable-diffusion-2-1-base':31.16,
@@ -36,8 +37,6 @@ DICT_B={'stabilityai/stable-diffusion-2-1':7.2,
     'stabilityai/stable-diffusion-2-1-base':52.53,
     "CompVis/stable-diffusion-v1-4":4.33,
     "runwayml/stable-diffusion-v1-5":4.33}
-
-
 def get_prompt_embeds(model:StableDiffusionPipeline,prompt,referenceProps,
                           attention_mask: Optional[torch.Tensor] = None,
                           output_attentions: Optional[bool] = None,
@@ -81,8 +80,7 @@ def get_prompt_embeds(model:StableDiffusionPipeline,prompt,referenceProps,
         
         for i in range(Num):
             for weight,id in referenceProps:
-                  if id != 1:
-                    inputs_embeds[i][id] = weight.to(torch.float16)
+                inputs_embeds[i][id] = weight.to(torch.float16)
         position_embeddings = embeddings.position_embedding(position_ids)
         hidden_states = inputs_embeds + position_embeddings
          # CLIP's text model uses causal mask, prepare it here.
@@ -136,6 +134,8 @@ def get_prompt_embeds(model:StableDiffusionPipeline,prompt,referenceProps,
         )[0]
  
 logger = logging.get_logger(__name__)
+
+
 
 class AttendAndExcitePipeline(StableDiffusionPipeline):
     r"""
@@ -1074,8 +1074,7 @@ class TextaulStableDiffusionXLPipeline(StableDiffusionXLPipeline):
         device = device or self._execution_device
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
-        # prompt_2 = prompt_2 or prompt
-        prompt_2  = "A clear and high-quality image"
+        prompt_2 = prompt_2 or prompt
         prompt_2 = [prompt_2] if isinstance(prompt_2, str) else prompt_2
         text_inputs = self.tokenizer(
                 prompt,
@@ -1173,12 +1172,6 @@ class TextaulStableDiffusionXLPipeline(StableDiffusionXLPipeline):
         prompt_embeds = torch.concat([prompt_embeds,prompt_embeds_2], dim=-1) if prompt_embeds_2 is not None else prompt_embeds
         return prompt_embeds,pooled_prompt_embeds
 
-    def get_latent(self,image,t,noises):
-        image = image.to(self.device,dtype=noises.dtype)
-        latent = self.vae.encode(image).latent_dist.mean*self.vae.config.scaling_factor
-        noises_latent = self.scheduler.add_noise(latent, noises, t)
-        return noises_latent
-    
     @torch.no_grad()
     def __call__(
         self,
@@ -1292,7 +1285,7 @@ class TextaulStableDiffusionXLPipeline(StableDiffusionXLPipeline):
                 weight = F.normalize(weight, dim=-1)
                 weight = 27.63*weight
                 bais = F.normalize(bais, dim=-1)
-                bais = 1.28*bais
+                bais = 4.33*bais
                 weight = torch.matmul(weight,self.token_dict['features'])+bais
                 weight = weight*self.token_dict['std']+self.token_dict['mean']
                 placeholder_token_embed = weight
@@ -1512,6 +1505,8 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
         latent = self.vae.encode(image).latent_dist.mean*self.vae.config.scaling_factor
         noises_latent = self.scheduler.add_noise(latent, noises, t)
         return noises_latent
+    
+    
     @torch.no_grad()
     def __call__(
             self,
@@ -1539,16 +1534,12 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
             scale_range: Tuple[float, float] = (1., 0.5),
             guidance_rescale: float = 0.0,
             clip_skip: Optional[int] = None,
-            seg_mask1: Optional[Union[Image.Image, np.ndarray]] = None,
-            seg_mask2: Optional[Union[Image.Image, np.ndarray]] = None,
-            is_pre: bool = True
     ):
         self._guidance_scale = guidance_scale
         self._guidance_rescale = guidance_rescale
         self._clip_skip = clip_skip
         self._cross_attention_kwargs = cross_attention_kwargs
         self._interrupt = False
-        self.mask = None
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
@@ -1578,9 +1569,6 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
         # 3. Encode input prompt 
         ## 3.1 get images prop
         prompt_embeds = []
-        combined_embeddings = []
-        combined_embedding = []
-        referenceProps_combined = []
         if referenceImages is not None:
             for images,locations,prom in zip(referenceImages,referenceLocattion,prompt):
                 referenceProps = []
@@ -1598,29 +1586,8 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
                     weight = torch.matmul(weight,self.token_dict['features'])+bais
                     weight = weight*self.token_dict['std']+self.token_dict['mean']
                     placeholder_token_embed = weight
-                    referenceProps.append((placeholder_token_embed,location+1))                    
-                    combined_embeddings += placeholder_token_embed
+                    referenceProps.append((placeholder_token_embed,location+1))
                 prompt_embeds.append(get_prompt_embeds(self,prom,referenceProps))
-                
-            #Process the third prompt
-            with torch.enable_grad():
-                c_o = prompt_embeds[0].detach().clone().requires_grad_(True)
-                for i in range(501):  # 200
-                    a  = 1 - F.cosine_similarity(prompt_embeds[0], c_o, dim=-1)
-                    b = 1.99*(1 - F.cosine_similarity(prompt_embeds[1], c_o, dim=-1))
-                    loss = a + b + 0.1 * abs(a - b)
-
-                    # loss = 1 * (1 - F.cosine_similarity(prompt_embeds[0], c_o, dim=-1)) + 2.72 * (1 - F.cosine_similarity(prompt_embeds[1], c_o, dim=-1))
-                    # if i % 100 == 0:
-                    #     print("{}th iterration loss: {}".format(i+1, loss.sum()))
-                    grad = torch.autograd.grad(loss.sum(), c_o)[0]
-                    #print("grad:", grad.shape)
-                    c_o = c_o - 1.0 * grad  # 10
-            prompt_embeds.append(c_o)
-            # referenceProps_combined.append(( combined_embeddings[0],referenceLocattion[2][0]+1))
-            # referenceProps_combined.append((0.8 * combined_embeddings[1],referenceLocattion[2][1]+1))
-            # prompt_embeds.append(get_prompt_embeds(self,prompt[2],referenceProps_combined))
-  
         prompt_embeds = torch.cat(prompt_embeds,dim = 0)    
         ## 3.2 Encode input prompt
         lora_scale = (
@@ -1646,22 +1613,20 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
         timesteps = self.scheduler.timesteps
 
         # 5. Prepare latent variables
-        
-        # noise = torch.randn((1,4,64,64)).to(self.device,dtype=self.vae.dtype)
-        # latent = self.get_latent(pixel_values[0],torch.tensor([999],dtype=torch.int64,device=self.device),noise)
-        # latents = torch.cat([latent,latent,latent],dim=0)
-        
-        num_channels_latents = self.unet.config.in_channels
-        latents = self.prepare_latents(
-            batch_size * num_images_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
-        )
+        noise = torch.randn((1, 4,64,64)).to(self.device,dtype=self.vae.dtype)
+        latent = self.get_latent(pixel_values[0],torch.tensor([999],dtype=torch.int64,device=self.device),noise)
+        latents = torch.cat([latent,latent],dim=0)
+        # num_channels_latents = self.unet.config.in_channels
+        # latents = self.prepare_latents(
+        #     batch_size * num_images_per_prompt,
+        #     num_channels_latents,
+        #     height,
+        #     width,
+        #     prompt_embeds.dtype,
+        #     device,
+        #     generator,
+        #     latents,
+        # )
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -1671,16 +1636,18 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
         controller.turn_on()
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
                 # latents = self.scheduler.add_noise(img_latents, noise, t)
                 # noisy_latents = self.scheduler.add_noise(img_latents, noise, t)
-                controller.timestep = i
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
                 # predict the noise residual
+                if i in range(0,38):
+                    controller.turn_on()
+                else: 
+                    controller.turn_off()
                 noise_pred = self.unet(
                     latent_model_input,
                     t,
@@ -1695,87 +1662,24 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
-                # if i<10:
-                #     latents[1] = latents[1] + 1.0* (latents[0] -latents[1])
-                #下面这边就是写把提取的mask串联起来的逻辑
-                if i == 5 and not is_pre: 
-                    # mask = get_cluter(controller.attentionStore,num_segments=5)
-                    # token_map1 = cluster2noun(controller.attentionStore,mask,[i for i in range(len(prompt[0].split(' ')))],num_segments=5,index=0)
-                    # background_mask1 = get_background_mask(mask[0],token_map1,num_segments=5)
-                    # mask1 = (background_mask1 == 3)
+                if i==30:
+                    mask = get_cluter(controller.attentionStore,num_segments=5)
+                    #token_map = cluster2noun(controller.attentionStore,mask,[i for i in range(len(prompt[0].split(' ')))],num_segments=5)
+                    #background_mask = get_background_mask(mask,token_map,num_segments=5)
+                    min_v = mask.min()
+                    max_v = mask.max()
+                    mask_ = (mask - min_v) / (max_v - min_v)
                     
-                    # token_map2 = cluster2noun(controller.attentionStore,mask,[i for i in range(len(prompt[1].split(' ')))],num_segments=5,index=1)
-                    # background_mask2 = get_background_mask(mask[1],token_map2,num_segments=5)
-                    # # mask2 = (background_mask2 == 3)
-                    #mask1 = torch.from_numpy(mask1).to(device=self._execution_device,dtype=latents.dtype)
-                    seg_mask1 = seg_mask1.to(device=self._execution_device, dtype=latents.dtype)
-                    # mask1 = torch.nn.functional.interpolate(mask1.unsqueeze(0).unsqueeze(0), size=(64, 64), mode="nearest")
-                    # mask1 = mask1.reshape(64,64)
-                    controller.mask1 = seg_mask1
-                    #mask2 = torch.from_numpy(mask2).to(device=self._execution_device,dtype=latents.dtype)
-                    
-                    seg_mask2 = seg_mask2.to(device=self._execution_device, dtype=latents.dtype)
-                    # # mask2 = torch.nn.functional.interpolate(mask2.unsqueeze(0).unsqueeze(0), size=(64, 64), mode="nearest")
-                    # mask2 = mask2.reshape(64,64)
-                    controller.mask2 = seg_mask2
-                    # min_v1 = mask[0].min()
-                    # max_v1 = mask[0].max()
-                    # mask_1 = (mask[0] - min_v1) / (max_v1 - min_v1)
-                    # mask_1[mask_1 == 0] = float('-inf')
-                    # mask_1 = np.where((mask_1 == 0.5) | (mask_1 == 0.75), 1, mask_1)  # 将 0.5 和 0.75 替换为 0
-                    # mask_1[mask_1 != 0] = float('-inf')  # 将其他非零值替换为 -inf
-                    
-                    # mask1 = torch.from_numpy(mask_1).to(device=self._execution_device,dtype=latents.dtype)
-                    # mask1 = torch.nn.functional.interpolate(mask1.unsqueeze(0).unsqueeze(0), size=(64, 64), mode="nearest")
-                    # mask_image1 = to_pil_image(mask1 * 255)
-                    # mask_image1.save(f"mask/first_mask_{i}.png")
-                    #五块都有的写法
-                    # mask_1 = 255*mask_1
-                    # mask_1 = mask_1.astype(np.uint8)
-                    # mask_1 = Image.fromarray(mask_1)
-                    # mask_1.save(f'mask/first_background_mask_{i}.png')
-                    
-                    # min_v2 = mask[1].min()
-                    # max_v2 = mask[1].max()
-                    # mask_2 = (mask[1] - min_v2) / (max_v2 - min_v2) 
-                    # mask_2[mask_2 == 0] = float('-inf')
-                    # mask_2 = np.where((mask_2 == 0.5) | (mask_2 == 0.75), 0, mask_2)  # 将 0.5 和 0.75 替换为 0
-                    # mask_2[mask_2 != 0] = float('-inf')  # 将其他非零值替换为 -inf                   
-                    # mask2 = torch.from_numpy(mask_2).to(device=self._execution_device,dtype=latents.dtype)
-                    # mask2 = torch.nn.functional.interpolate(mask2.unsqueeze(0).unsqueeze(0), size=(64, 64), mode="nearest")
-                    # mask2 = mask2.reshape(64,64)
-                    # mask_image2 = to_pil_image(mask2 * 255)                  
-                    # mask_image2.save(f"mask/sec_mask_{i}.png")
-                    
-                    # mask_2 = 255*mask_2
-                    # mask_2 = mask_2.astype(np.uint8)
-                    # mask_2 = Image.fromarray(mask_2)
-                    # mask_2.save(f'mask/sec_background_mask_{i}.png')
-                    
-                    
-                    # controller.mask1 = mask1.reshape(64*64,1)
-                    # controller.mask2 = mask2.reshape(64*64,1)
-                    # mask1[mask1 == 0.5] = 0
-                    # mask1[mask1 == 0.75] = 0
-                    # mask1[(mask1 != 0.5) & (mask1 != 0.75)] = float('-inf')
-                    
-                    # mask2[mask2 == 0] = 0
-                    # mask2[mask2 == 0.25] = 0
-                    # mask2[(mask2 != 0.25) & (mask2 != 0)] = float('-inf')
-                    
-                    # self.mask = torch.cat((mask1, mask2), dim=0)  # 拼接后的形状为 (2 * 64 * 64, 1)
-                    
-                    # controller.mask = self.mask.unsqueeze(0)  # 在前面添加一维，形状变为 (1, 2 * 64 * 64, 1)
-                    # controller.mask = controller.mask.permute(0, 2, 1)  
-                    # mask_image2 = to_pil_image(mask2 * 255)
-                    
-                    # mask_image2.save(f"mask/sec_mask_{i}.png")
-                    # mask_2 = 255*mask_2
-                    # mask_2 = mask_2.astype(np.uint8)
-                    # mask_2 = Image.fromarray(mask_2)
-                    # mask_2.save(f'mask/sec_background_mask_{i}.png')
-                    # latents[1] = mask*latents[0]+(1-mask)*latents[1]
-                    
+                    mask = torch.from_numpy(mask_).to(device=self._execution_device,dtype=latents.dtype)
+                    mask = torch.nn.functional.interpolate(mask.unsqueeze(0).unsqueeze(0), size=(64, 64), mode="nearest")
+                    mask = mask.reshape(64,64)
+                    mask_image = to_pil_image(mask * 255)
+                    mask_image.save(f"mask/{prompt[0]}_mask_{i}.png")
+                    mask_ = 255*mask_
+                    mask_ = mask_.astype(np.uint8)
+                    mask_ = Image.fromarray(mask_)
+                    mask_.save(f'mask/background_mask_{i}.png')
+                    latents[1] = mask*latents[0]+(1-mask)*latents[1]
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
@@ -1806,517 +1710,6 @@ class TextaulandContrPipeline(StableDiffusionPipeline):
             return (image, has_nsfw_concept)
 
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
-
-
-
-class TextaulandContrXLPipeline(StableDiffusionXLPipeline):
-    
-    def get_prompt_embeds(self,prompt,referenceProps,
-                          prompt_2: Optional[Union[str, List[str]]] = None,
-                          attention_mask: Optional[torch.Tensor] = None,
-                          output_attentions: Optional[bool] = None,
-                          device: Optional[torch.device] = None,
-                          output_hidden_states: Optional[bool] = True,
-                          return_dict: Optional[bool] = None,
-                          clip_skip: Optional[int] = None):
-        device = device or self._execution_device
-        prompt = [prompt] if isinstance(prompt, str) else prompt
-
-        # Define tokenizers and text encoders
-        tokenizers = [self.tokenizer, self.tokenizer_2] if self.tokenizer is not None else [self.tokenizer_2]
-        text_encoders = (
-            [self.text_encoder, self.text_encoder_2] if self.text_encoder is not None else [self.text_encoder_2]
-        )
-        prompt_2 = prompt_2 or prompt
-        prompt_2 = [prompt_2] if isinstance(prompt_2, str) else prompt_2
-        # textual inversion: procecss multi-vector tokens if necessary
-        prompt_embeds_list = []
-        prompts = [prompt, prompt_2]
-        for prompt,referenceProp,tokenizer, text_encoder in zip(prompts, referenceProps,tokenizers, text_encoders):
-            if isinstance(self, TextualInversionLoaderMixin):
-                    prompt = self.maybe_convert_prompt(prompt, tokenizer)
-
-            text_inputs = tokenizer(
-                prompt,
-                padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-
-            text_input_ids = text_inputs.input_ids
-            untruncated_ids = tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
-
-            if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
-                text_input_ids, untruncated_ids
-            ):
-                removed_text = tokenizer.batch_decode(untruncated_ids[:, tokenizer.model_max_length - 1 : -1])
-                logger.warning(
-                    "The following part of your input was truncated because CLIP can only handle sequences up to"
-                    f" {tokenizer.model_max_length} tokens: {removed_text}"
-                )
-            input_ids = text_input_ids.to(device)
-            # input_ids = torch.cat(input_ids,dim=0)
-            Num,seq_length = input_ids.shape
-            input_shape = (Num,seq_length)
-            embeddings = text_encoder.text_model.embeddings
-            position_ids = embeddings.position_ids[:, :seq_length]
-            inputs_embeds = embeddings.token_embedding(input_ids)
-            
-            for i in range(Num):
-                for weight,id in referenceProp:
-                    if id != 1:
-                        inputs_embeds[i][id] = weight.to(torch.float16)
-            
-            position_embeddings = embeddings.position_embedding(position_ids)
-            hidden_states = inputs_embeds + position_embeddings
-            # CLIP's text model uses causal mask, prepare it here.
-            # https://github.com/openai/CLIP/blob/cfcffb90e69f37bf2ff1e988237a0fbe41f33c04/clip/model.py#L324
-            causal_attention_mask = _make_causal_mask(input_shape, hidden_states.dtype, device=hidden_states.device)
-            # expand attention_mask
-            if attention_mask is not None:
-                # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-                attention_mask = _expand_mask(attention_mask, hidden_states.dtype)
-        
-            if isinstance(text_encoder,CLIPTextModelWithProjection):
-                encoder_outputs = text_encoder.text_model.encoder(
-                                inputs_embeds=hidden_states,
-                                attention_mask=attention_mask,
-                                causal_attention_mask=causal_attention_mask,
-                                output_hidden_states=output_hidden_states,
-                            )
-                last_hidden_state = encoder_outputs[0]
-                last_hidden_state = text_encoder.text_model.final_layer_norm(last_hidden_state)
-
-                if text_encoder.text_model.eos_token_id == 2:
-                    # The `eos_token_id` was incorrect before PR #24773: Let's keep what have been done here.
-                    # A CLIP model with such `eos_token_id` in the config can't work correctly with extra new tokens added
-                    # ------------------------------------------------------------
-                    # text_embeds.shape = [batch_size, sequence_length, transformer.width]
-                    # take features from the eot embedding (eot_token is the highest number in each sequence)
-                    # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
-                    pooled_output = last_hidden_state[
-                        torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
-                        input_ids.to(dtype=torch.int, device=last_hidden_state.device).argmax(dim=-1),
-                    ]
-                else:
-                    # The config gets updated `eos_token_id` from PR #24773 (so the use of exta new tokens is possible)
-                    pooled_output = last_hidden_state[
-                        torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
-                        # We need to get the first position of `eos_token_id` value (`pad_token_ids` might equal to `eos_token_id`)
-                        (input_ids.to(dtype=torch.int, device=last_hidden_state.device) == self.eos_token_id)
-                        .int()
-                        .argmax(dim=-1),
-                    ]
-                text_embeds = text_encoder.text_projection(pooled_output)
-                prompt_embeds = CLIPTextModelOutput(
-                            text_embeds=text_embeds,
-                            last_hidden_state=last_hidden_state,
-                            hidden_states=encoder_outputs.hidden_states,
-                            attentions=encoder_outputs.attentions
-                        )
-            else:
-                prompt_embeds = text_encoder.text_model.encoder(
-                    inputs_embeds=hidden_states,
-                    attention_mask=attention_mask,
-                    causal_attention_mask=causal_attention_mask,
-                    output_hidden_states=output_hidden_states
-                )
-
-            # We are only ALWAYS interested in the pooled output of the final text encoder
-            pooled_prompt_embeds = prompt_embeds[0]
-            if clip_skip is None:
-                prompt_embeds = prompt_embeds.hidden_states[-2]
-            else:
-                # "2" because SDXL always indexes from the penultimate layer.
-                prompt_embeds = prompt_embeds.hidden_states[-(clip_skip + 2)]
-
-            prompt_embeds_list.append(prompt_embeds)
-            
-        prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
-        return prompt_embeds,pooled_prompt_embeds
-
-    @torch.no_grad()
-    def __call__(
-        self,
-        prompt: Union[str, List[str]] = None,
-        prompt_2: Optional[Union[str, List[str]]] = None,
-        referenceImages: List[torch.Tensor] = None,
-        referenceLocattion: List[int] = None,
-        controller:TextualControl=None,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        num_inference_steps: int = 50,
-        timesteps: List[int] = None,
-        denoising_end: Optional[float] = None,
-        guidance_scale: float = 5.0,
-        negative_prompt: Optional[Union[str, List[str]]] = None,
-        negative_prompt_2: Optional[Union[str, List[str]]] = None,
-        num_images_per_prompt: Optional[int] = 1,
-        eta: float = 0.0,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.FloatTensor] = None,
-        prompt_embeds: Optional[torch.FloatTensor] = None,
-        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
-        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
-        negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
-        ip_adapter_image: Optional[PipelineImageInput] = None,
-        output_type: Optional[str] = "pil",
-        return_dict: bool = True,
-        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-        guidance_rescale: float = 0.0,
-        original_size: Optional[Tuple[int, int]] = None,
-        crops_coords_top_left: Tuple[int, int] = (0, 0),
-        target_size: Optional[Tuple[int, int]] = None,
-        negative_original_size: Optional[Tuple[int, int]] = None,
-        negative_crops_coords_top_left: Tuple[int, int] = (0, 0),
-        negative_target_size: Optional[Tuple[int, int]] = None,
-        clip_skip: Optional[int] = None,
-        callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
-        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
-        seg_mask1: Optional[Union[Image.Image, np.ndarray]] = None,
-        seg_mask2: Optional[Union[Image.Image, np.ndarray]] = None,
-        is_pre: bool = True,
-        **kwargs,
-    ):
-        callback = kwargs.pop("callback", None)
-        callback_steps = kwargs.pop("callback_steps", None)
-
-        if callback is not None:
-            deprecate(
-                "callback",
-                "1.0.0",
-                "Passing `callback` as an input argument to `__call__` is deprecated, consider use `callback_on_step_end`",
-            )
-        if callback_steps is not None:
-            deprecate(
-                "callback_steps",
-                "1.0.0",
-                "Passing `callback_steps` as an input argument to `__call__` is deprecated, consider use `callback_on_step_end`",
-            )
-
-        # 0. Default height and width to unet
-        height = height or self.default_sample_size * self.vae_scale_factor
-        width = width or self.default_sample_size * self.vae_scale_factor
-
-        original_size = original_size or (height, width)
-        target_size = target_size or (height, width)
-
-        # 1. Check inputs. Raise error if not correct
-        self.check_inputs(
-            prompt,
-            prompt_2,
-            height,
-            width,
-            callback_steps,
-            negative_prompt,
-            negative_prompt_2,
-            prompt_embeds,
-            negative_prompt_embeds,
-            pooled_prompt_embeds,
-            negative_pooled_prompt_embeds,
-            callback_on_step_end_tensor_inputs,
-        )
-
-        self._guidance_scale = guidance_scale
-        self._guidance_rescale = guidance_rescale
-        self._clip_skip = clip_skip
-        self._cross_attention_kwargs = cross_attention_kwargs
-        self._denoising_end = denoising_end
-        self._interrupt = False
-        device = self._execution_device
-        image_model = self.image_model.to(device)
-        image_model_2 = self.image_model_2.to(device)
-        # self.image_model.eval()
-        for key in self.token_dict.keys():
-            self.token_dict[key] =self.token_dict[key].to(device)
-            self.token_dict[key].requires_grad_(False)
-        # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
-        
-
-        # 3. Encode input prompt
-        ## 3.1 get images prop
-        prompt_embeds = []
-        pooled_prompt_embeds = []
-        if referenceImages is not None:
-            referenceProps = []
-            referenceProps_2 = []
-            for images,locations,prom in zip(referenceImages,referenceLocattion,prompt):
-                referenceProps = []
-                referenceProps_2 = []
-                for image,location in zip(images,locations):
-                    image= image.to(device)
-                    image = torch.unsqueeze(image,dim=0)
-                    weight,bais = image_model(image)
-                    weight_2,bais_2 = image_model_2(image)
-                    '''
-                    $weight = 27.68*\frac{w}{||w||}\cdot feat + b}$
-                    $weigh_2 = mean_2*\frac{w}{||w_2||}\cdot feat + b_2 $
-                    mean:27.68309783935547,std: 1.2829711437225342
-                    mean_2:34.74772644042969,std_2: 8.520829200744629
-
-                    '''
-                    weight = 27.68*F.normalize(weight, dim=-1)
-                    weight = torch.matmul(weight,self.token_dict['features']) +bais
-                    placeholder_token_embed = weight*self.token_dict['std']+self.token_dict['mean']
-
-                    weight_2 = 34.74*F.normalize(weight_2, dim=-1)
-                    weight_2 = torch.matmul(weight_2,self.token_dict['features_2']) +bais_2
-                    placeholder_token_embed_2 = weight_2*self.token_dict['std_2']+self.token_dict['mean_2']
-
-                    referenceProps.append((placeholder_token_embed,location+1))
-                    referenceProps_2.append((placeholder_token_embed_2,location+1))
-                tmp_prompt_embeds,tmp_pooled_prompt_embeds = self.get_prompt_embeds(prom,[referenceProps,referenceProps_2],
-                                                   prompt_2=None,
-                                                   device = device,
-                                                   clip_skip=clip_skip)
-                prompt_embeds.append(tmp_prompt_embeds)
-                pooled_prompt_embeds.append(tmp_pooled_prompt_embeds)
-
-            # c_tmp = prompt_embeds[0].detach().clone()
-            c_o = prompt_embeds[0].detach().clone()[:,:,:768]
-            co_2 = prompt_embeds[1].detach().clone()[:,:,768:]
-            pooled_co = pooled_prompt_embeds[0].detach().clone()
-            with torch.enable_grad():
-                c_o = c_o.requires_grad_(True)
-                co_2  = co_2.requires_grad_(True)
-                for i in range(200):  # 200
-                    # a  = 1 - F.cosine_similarity(prompt_embeds[0][:,:,:768], c_o, dim=-1)
-                    # b = 1 - F.cosine_similarity(prompt_embeds[1][:,:,:768], c_o, dim=-1)
-                    # loss = a + b + 0.01 * abs(a - b) ## w w 1.75 / i w 1.5 / i i 1.2
-                    # grad = torch.autograd.grad(loss.sum(), c_o)[0]
-                    # c_o = c_o - 1.0 * grad  # 10
-
-
-
-                    a_2 = 1 - F.cosine_similarity(prompt_embeds[0][:,:,768:], co_2, dim=-1)
-                    b_2 = 1 - F.cosine_similarity(prompt_embeds[1][:,:,768:], co_2, dim=-1)
-                    loss_2 = a_2 + b_2 + 0.01 * abs(a_2 - b_2)
-                    grad_2 = torch.autograd.grad(loss_2.sum(), co_2)[0]
-                    co_2 = co_2 - 1.0 * grad_2
-            
-            c_o = torch.cat([c_o.detach(),co_2.detach()],dim=-1)
-            pooled_co = pooled_co.detach()
-            prompt_embeds.append(c_o)
-            pooled_prompt_embeds.append(pooled_co)
-        
-        prompt_embeds = torch.cat(prompt_embeds,dim = 0)
-        pooled_prompt_embeds = torch.cat(pooled_prompt_embeds,dim = 0)
-        ## 3.2 Encode input prompt
-        lora_scale = (
-            self.cross_attention_kwargs.get("scale", None) if self.cross_attention_kwargs is not None else None
-        )
-        (
-            prompt_embeds,
-            negative_prompt_embeds,
-            pooled_prompt_embeds,
-            negative_pooled_prompt_embeds,
-        ) = self.encode_prompt(
-            prompt=prompt,
-            prompt_2=prompt_2,
-            device=device,
-            num_images_per_prompt=num_images_per_prompt,
-            do_classifier_free_guidance=self.do_classifier_free_guidance,
-            negative_prompt=negative_prompt,
-            negative_prompt_2=negative_prompt_2,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            pooled_prompt_embeds=pooled_prompt_embeds,
-            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
-            lora_scale=lora_scale,
-            clip_skip=self.clip_skip,
-        )
-
-        # 4. Prepare timesteps
-        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
-
-        # 5. Prepare latent variables
-        num_channels_latents = self.unet.config.in_channels
-        latents = self.prepare_latents(
-            batch_size * num_images_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
-        )
-
-        # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
-        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-
-        # 7. Prepare added time ids & embeddings
-        add_text_embeds = pooled_prompt_embeds
-        if self.text_encoder_2 is None:
-            text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
-        else:
-            text_encoder_projection_dim = self.text_encoder_2.config.projection_dim
-
-        add_time_ids = self._get_add_time_ids(
-            original_size,
-            crops_coords_top_left,
-            target_size,
-            dtype=prompt_embeds.dtype,
-            text_encoder_projection_dim=text_encoder_projection_dim,
-        )
-        if negative_original_size is not None and negative_target_size is not None:
-            negative_add_time_ids = self._get_add_time_ids(
-                negative_original_size,
-                negative_crops_coords_top_left,
-                negative_target_size,
-                dtype=prompt_embeds.dtype,
-                text_encoder_projection_dim=text_encoder_projection_dim,
-            )
-        else:
-            negative_add_time_ids = add_time_ids
-
-        if self.do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
-            add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
-
-        prompt_embeds = prompt_embeds.to(device)
-        add_text_embeds = add_text_embeds.to(device)
-        add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
-
-        if ip_adapter_image is not None:
-            output_hidden_state = False if isinstance(self.unet.encoder_hid_proj, ImageProjection) else True
-            image_embeds, negative_image_embeds = self.encode_image(
-                ip_adapter_image, device, num_images_per_prompt, output_hidden_state
-            )
-            if self.do_classifier_free_guidance:
-                image_embeds = torch.cat([negative_image_embeds, image_embeds])
-                image_embeds = image_embeds.to(device)
-
-        # 8. Denoising loop
-        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
-
-        # 8.1 Apply denoising_end
-        if (
-            self.denoising_end is not None
-            and isinstance(self.denoising_end, float)
-            and self.denoising_end > 0
-            and self.denoising_end < 1
-        ):
-            discrete_timestep_cutoff = int(
-                round(
-                    self.scheduler.config.num_train_timesteps
-                    - (self.denoising_end * self.scheduler.config.num_train_timesteps)
-                )
-            )
-            num_inference_steps = len(list(filter(lambda ts: ts >= discrete_timestep_cutoff, timesteps)))
-            timesteps = timesteps[:num_inference_steps]
-
-        # 9. Optionally get Guidance Scale Embedding
-        timestep_cond = None
-        if self.unet.config.time_cond_proj_dim is not None:
-            guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(batch_size * num_images_per_prompt)
-            timestep_cond = self.get_guidance_scale_embedding(
-                guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
-            ).to(device=device, dtype=latents.dtype)
-
-        self._num_timesteps = len(timesteps)
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
-
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
-                # predict the noise residual
-                added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
-                if ip_adapter_image is not None:
-                    added_cond_kwargs["image_embeds"] = image_embeds
-                noise_pred = self.unet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep_cond=timestep_cond,
-                    cross_attention_kwargs=self.cross_attention_kwargs,
-                    added_cond_kwargs=added_cond_kwargs,
-                    return_dict=False,
-                )[0]
-
-                # perform guidance
-                if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-                if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
-                    # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-                    noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
-
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
-
-                if i==5 and not is_pre:
-                    seg_mask1 = seg_mask1.to(device=self._execution_device, dtype=latents.dtype)
-                    controller.mask1 = seg_mask1
-                    seg_mask2 = seg_mask2.to(device=self._execution_device, dtype=latents.dtype)
-                    controller.mask2 = seg_mask2
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
-                    add_text_embeds = callback_outputs.pop("add_text_embeds", add_text_embeds)
-                    negative_pooled_prompt_embeds = callback_outputs.pop(
-                        "negative_pooled_prompt_embeds", negative_pooled_prompt_embeds
-                    )
-                    add_time_ids = callback_outputs.pop("add_time_ids", add_time_ids)
-                    negative_add_time_ids = callback_outputs.pop("negative_add_time_ids", negative_add_time_ids)
-
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
-                    if callback is not None and i % callback_steps == 0:
-                        step_idx = i // getattr(self.scheduler, "order", 1)
-                        callback(step_idx, t, latents)
-
-        if not output_type == "latent":
-            # make sure the VAE is in float32 mode, as it overflows in float16
-            needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
-
-            if needs_upcasting:
-                self.upcast_vae()
-                latents = latents.to(next(iter(self.vae.post_quant_conv.parameters())).dtype)
-
-            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-
-            # cast back to fp16 if needed
-            if needs_upcasting:
-                self.vae.to(dtype=torch.float16)
-        else:
-            image = latents
-
-        if not output_type == "latent":
-            # apply watermark if available
-            if self.watermark is not None:
-                image = self.watermark.apply_watermark(image)
-
-            image = self.image_processor.postprocess(image, output_type=output_type)
-
-        # Offload all models
-        self.maybe_free_model_hooks()
-
-        if not return_dict:
-            return (image,)
-
-        return StableDiffusionXLPipelineOutput(images=image)
 
 class BlendedDiffusionPipeline(StableDiffusionPipeline):
     def _read_mask(self, mask_path: str, dest_size=(96, 96),dtype=torch.float16):
@@ -2478,7 +1871,7 @@ class BlendedDiffusionPipeline(StableDiffusionPipeline):
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                if i<-1:
+                if i<10:
                     mask = get_cluter(attention_store,num_segments=5)
                     token_map = cluster2noun(attention_store,mask,[i for i in range(len(prompt.split(' ')))],num_segments=5)
                     background_mask = get_background_mask(mask,token_map,num_segments=5)

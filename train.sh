@@ -5,7 +5,7 @@
 # CompVis/stable-diffusion-v1-4
 # stabilityai/stable-diffusion-xl-base-1.0
 export MODEL_NAME="stabilityai/stable-diffusion-2-1"
-export DATA_DIR="datasets/Mixed_dataset"
+export DATA_DIR="datasets/new_datasets"
 ROOT="/opt/data/private/stable_diffusion_model"
 DIR="textual_inversion_find_mixed_864_2_1_2"
 CUDA_VISIBLE_DEVICES=0,1 
@@ -28,7 +28,7 @@ accelerate launch main.py \
   --out_dim=864 \
   --cls_dim=10 \
   --repeats 100 \
-  --unlabelled 11 \
+  --unlabelled 30 \
   --style_name "Ande Cubism Cute Fauvism Gta5 Landscape_painting" \
   --output_dir=${ROOT}/${DIR}
 

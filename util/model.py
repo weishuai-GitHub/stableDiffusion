@@ -86,6 +86,11 @@ class MLP(nn.Module):
             nn.Linear(512, bottleneck_dim),
         ])
         self.apply(self._init_weights)
+        for m in self.bais:
+            if isinstance(m,nn.Linear):
+                nn.init.zeros_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
         # if norm_last_layer:
         #     self.last_layer.weight_g.requires_grad = False
 

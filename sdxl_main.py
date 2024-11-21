@@ -54,7 +54,7 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
-from util.ptp_utils import TextualCLIPTextModel, TextualInversionXLDataset
+from util.ptp_utils import TextualCLIPTextModel,TextualCLIPTextModelWithProjection, TextualInversionXLDataset
 from util.model import DINOHead,MLP
 from util.utils import DistillLoss, SupConLoss,get_params_groups, info_nce_logits
 
@@ -389,7 +389,8 @@ def parse_args():
         help="If specified save the checkpoint not in `safetensors` format, but in original PyTorch format instead.",
     )
     parser.add_argument('--grad_from_block', type=int, default=11)
-    parser.add_argument('--out_dim',type=int,default=10)
+    parser.add_argument('--out_dim',type=int,default=768)
+    parser.add_argument('--out_dim_2',type=int,default=960)
     parser.add_argument('--cls_dim',type=int,default=6)
 
     parser.add_argument('--n_views', default=2, type=int)
@@ -460,7 +461,7 @@ def main():
     text_encoder_1 = TextualCLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
     )
-    text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
+    text_encoder_2 = TextualCLIPTextModelWithProjection.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision
     )
     vae = AutoencoderKL.from_pretrained(
@@ -488,6 +489,7 @@ def main():
         token_dict[key] = token_dict[key].to(accelerator.device)
         token_dict[key].requires_grad_(False)
     bottleneck_dim = token_dict['features'].shape[-1]
+    bottleneck_dim_2 = token_dict['features_2'].shape[-1]
 
     # Freeze vae and unet
     vae.requires_grad_(False)
@@ -495,27 +497,36 @@ def main():
     text_encoder_1.requires_grad_(False)
     text_encoder_2.requires_grad_(False)
     # Freeze all parameters except for the token embeddings in text encoder
-    text_encoder_1.text_model.encoder.requires_grad_(False)
-    text_encoder_1.text_model.final_layer_norm.requires_grad_(False)
-    text_encoder_1.text_model.embeddings.position_embedding.requires_grad_(False)
+    # text_encoder_1.text_model.encoder.requires_grad_(False)
+    # text_encoder_1.text_model.final_layer_norm.requires_grad_(False)
+    # text_encoder_1.text_model.embeddings.position_embedding.requires_grad_(False)
 
     ##load model
     # state_dict = torch.load(moldel_root)['model']
     backbone = torch.hub.load('facebookresearch/dino:main', 'dino_vitb16',map_location='cpu')
+    backbone_2 = torch.hub.load('facebookresearch/dino:main', 'dino_vitb16',map_location='cpu')
     # Only finetune layers from block 'args.grad_from_block' onwards
     for name, m in backbone.named_parameters():
         m.requires_grad = False
-    for name, m in backbone.named_parameters():
+        if 'block' in name:
+            block_num = int(name.split('.')[1])
+            if block_num >= args.grad_from_block:
+                m.requires_grad = True
+    for name, m in backbone_2.named_parameters():
+        m.requires_grad = False
         if 'block' in name:
             block_num = int(name.split('.')[1])
             if block_num >= args.grad_from_block:
                 m.requires_grad = True
     # head = DINOHead(in_dim=768, out_dim=args.out_dim,cls_dim=args.cls_dim ,nlayers=3,norm_last_layer=False)
     head = MLP(in_dim=768, out_dim=args.out_dim,bottleneck_dim=bottleneck_dim ,nlayers=3)
+    head2 = MLP(in_dim=768, out_dim=args.out_dim_2,bottleneck_dim=bottleneck_dim_2 ,nlayers=3)
     # head.mlp.requires_grad_(False)
     model = torch.nn.Sequential(backbone, head)
+    model_2 = torch.nn.Sequential(backbone_2, head2)
     # model.load_state_dict(state_dict, strict=True)
     model.to(accelerator.device)
+    model_2.to(accelerator.device)
 
     image_size = 224
     crop_pct = 0.875
@@ -567,9 +578,10 @@ def main():
         optimizer_class = torch.optim.AdamW
 
     para = get_params_groups(model)
+    para_2 = get_params_groups(model_2)
 
     optimizer = optimizer_class(
-        para,  # only optimize the embeddings
+        para + para_2,  # only optimize the embeddings
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -612,9 +624,10 @@ def main():
     )
 
     model.train()
+    model_2.train()
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
+    model, model_2,optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model,model_2, optimizer, train_dataloader, lr_scheduler
     )
 
      # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
@@ -693,8 +706,9 @@ def main():
     progress_bar.set_description("Steps")
     for epoch in range(first_epoch, args.num_train_epochs):
         model.train()
+        model_2.train()
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(model):
+            with accelerator.accumulate(model,model_2):
                 # Convert images to latent space
                 latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample().detach()
                 latents = latents * vae.config.scaling_factor
@@ -713,24 +727,25 @@ def main():
                 # Get the text embedding for conditioning
                 image = batch["image"].to(accelerator.device)
                 strong_aug_image = batch["strong_aug_image"].to(accelerator.device)
-                weight,bais = model(image)
-                aug_image = model.module[1](model.module[0](strong_aug_image),is_bais = False)
-                
-                student_proj = torch.cat([weight,aug_image],dim=0)
-                contrastive_logits, contrastive_labels = info_nce_logits(features=student_proj)
-                contrastive_loss = torch.nn.CrossEntropyLoss()(contrastive_logits, contrastive_labels)
-                label_index = torch.where(batch["is_labelled"])[0]
-                if len(label_index) > 0:
-                    feature = torch.stack([F.normalize(x[label_index],dim=-1) for x in [weight,aug_image]],dim=1)
-                    contrastive_loss += SupConLoss()(feature, labels=batch["target"][label_index])
+                weight,bais = model(image)  
+                weight_2,bais_2 = model_2(image)
+
+                # aug_image = model.module[1](model.module[0](strong_aug_image),is_bais = False)
+                # student_proj = torch.cat([weight,aug_image],dim=0)
+                # contrastive_logits, contrastive_labels = info_nce_logits(features=student_proj)
+                # contrastive_loss = torch.nn.CrossEntropyLoss()(contrastive_logits, contrastive_labels)
+                # label_index = torch.where(batch["is_labelled"])[0]
+                # if len(label_index) > 0:
+                #     feature = torch.stack([F.normalize(x[label_index],dim=-1) for x in [weight,aug_image]],dim=1)
+                #     contrastive_loss += SupConLoss()(feature, labels=batch["target"][label_index])
                 
                 '''
-                $weight = 27.63*\frac{w}{||w||}\cdot feat + 4.33* \frac{b}{||b||}$
+                $weight = mean*\frac{w}{||w||}\cdot feat + b$
+                $weigh_2 = mean_2*\frac{w}{||w_2||}\cdot feat + b_2 $
+                mean:27.68309783935547,std: 1.2829711437225342
+                mean_2:34.74772644042969,std_2: 8.520829200744629
                 '''
-                weight = F.normalize(weight, dim=-1)
-                weight = 27.63*weight
-                bais = F.normalize(bais, dim=-1)
-                bais = 4.33*bais
+                weight = 27.68*F.normalize(weight, dim=-1)
                 weight = torch.matmul(weight,token_dict['features'])+bais
                 weight = weight*token_dict['std']+token_dict['mean']
 
@@ -744,8 +759,12 @@ def main():
                                     .hidden_states[-2]
                                     .to(dtype=weight_dtype)
                                 )
-
-                encoder_output_2 = text_encoder_2(
+                
+                weight_2 = 34.74*F.normalize(weight_2, dim=-1)
+                weight_2 = torch.matmul(weight_2,token_dict['features_2'])+bais_2
+                weight_2 = weight_2*token_dict['std_2']+token_dict['mean_2']
+                placeholder_token_embed_2 = weight_2.to(dtype=weight_dtype)
+                encoder_output_2 = text_encoder_2(placeholder_token_embed_2,batch["index_2"],
                     batch["input_ids_2"].reshape(batch["input_ids_1"].shape[0], -1), output_hidden_states=True
                 )
                 encoder_hidden_states_2 = encoder_output_2.hidden_states[-2].to(dtype=weight_dtype)
@@ -780,7 +799,7 @@ def main():
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                total_loss = loss + 0.5*contrastive_loss #+ 1e-1*reg_loss
+                total_loss = loss #+ 0.5*contrastive_loss + 1e-1*reg_loss
                 accelerator.backward(total_loss)
 
                 optimizer.step()
@@ -801,6 +820,7 @@ def main():
                     # save_path = os.path.join(args.output_dir, weight_name)
                     save_dict = {
                         'model': model.module.state_dict(),
+                        'model_2': model_2.module.state_dict(),
                         }
                     torch.save(save_dict, '{}/model_{}.pt'.format(args.output_dir,global_step))
                     accelerator.print(f"Saving learned embeddings to {args.output_dir}")
@@ -815,6 +835,7 @@ def main():
                     save_path = os.path.join(args.output_dir, weight_name)
                     save_dict = {
                         'model': model.module.state_dict(),
+                        'model_2': model_2.module.state_dict(),
                         }
                     torch.save(save_dict, '{}/model_{}.pt'.format(args.output_dir,global_step))
                     accelerator.print(f"Saving learned embeddings to {save_path}")
@@ -860,7 +881,7 @@ def main():
                         )
 
             logs = {"loss": loss.detach().item(),
-                    "contrastive_loss": contrastive_loss if isinstance(contrastive_loss,float) else contrastive_loss.detach().item(),
+                    # "contrastive_loss": contrastive_loss if isinstance(contrastive_loss,float) else contrastive_loss.detach().item(),
                     # "reg_loss": reg_loss if isinstance(reg_loss,float) else reg_loss.detach().item(),
                     "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -903,9 +924,8 @@ def main():
             )
 
     save_dict = {
-
-        
         'model': model.module.state_dict(),
+        'model_2': model_2.module.state_dict(),
         }
     torch.save(save_dict, '{}/model.pt'.format(args.output_dir))
     accelerator.end_training()
